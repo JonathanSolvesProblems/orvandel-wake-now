@@ -1,0 +1,36 @@
+﻿From 95aa36199d65e2eaa2e4d0cda99bb08ea20dcb20 Mon Sep 17 00:00:00 2001
+From: Jonathan Andrei <jon_andrei04@hotmail.com>
+Date: Tue, 20 Oct 2026 21:11:51 -0400
+Subject: [PATCH] Guest limit on the Worker kept in Durable Object storage so
+ an evicted object does not reset the hourly count
+
+---
+ worker/auth.ts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/worker/auth.ts b/worker/auth.ts
+index 31681f1..832e998 100644
+--- a/worker/auth.ts
++++ b/worker/auth.ts
+@@ -36,6 +36,8 @@ const PURGE_EVERY_MS = 3600_000;
+ export class AuthDO extends DurableObject<Env> {
+   private attempts = new Map<string, number[]>();
+   private guestHits = new Map<string, number[]>();
++  /** The guest count is also kept in storage: an idle object is evicted within a minute, which would reset a count held only in memory. */
++  private guestLoaded = false;
+   private dummy: Promise<string> | null = null;
+   private lastPurge = 0;
+ 
+@@ -77,7 +79,9 @@ export class AuthDO extends DurableObject<Env> {
+    */
+   async createGuest(terms: string): Promise<GuestOutcome> {
+     const max = Number(this.env.GUEST_RATE_LIMIT ?? GUEST_PER_HOUR) || GUEST_PER_HOUR;
++    if (!this.guestLoaded) { this.guestHits.set('ip', (await this.ctx.storage.get<number[]>('guestHits')) ?? []); this.guestLoaded = true; }
+     if (!allowPerHour(this.guestHits, 'ip', max)) return { ok: false, status: 429, error: GUEST_LIMITED };
++    await this.ctx.storage.put('guestHits', this.guestHits.get('ip') ?? []);
+     const db = repos(this.env.DB);
+     const hash = await pbkdf2Hash(guestSecret());
+     let acc: AccountRecord | null = null;
+-- 
+2.53.0.windows.2
+

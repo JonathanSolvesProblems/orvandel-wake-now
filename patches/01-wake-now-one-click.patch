@@ -1,0 +1,960 @@
+﻿From 3028f0bc6d83b057181d0d82ccd53d799b22cb11 Mon Sep 17 00:00:00 2001
+From: Jonathan Andrei <jon_andrei04@hotmail.com>
+Date: Tue, 20 Oct 2026 20:01:02 -0400
+Subject: [PATCH] Wake now: one click from the title screen into the world as a
+ guest hero
+
+---
+ client/src/game/index.ts     |  12 ++--
+ client/src/main.ts           |  13 +++-
+ client/src/net/api.ts        |   2 +
+ client/src/screens/login.ts  |  34 +++++++++-
+ client/src/screens/select.ts |   2 +-
+ client/src/styles/front.css  |  19 ++++++
+ migrations/0019_guest.sql    |   4 ++
+ package.json                 |   2 +-
+ server/api.ts                |  14 ++++-
+ server/auth-rules.ts         |   2 +
+ server/auth.ts               |  38 ++++++++++-
+ server/characters.ts         |  21 +++++++
+ server/db.ts                 |  26 ++++----
+ shared/guest.ts              |  81 ++++++++++++++++++++++++
+ shared/protocol.ts           |   4 +-
+ tests/cf-check.ts            |   8 +++
+ tests/verify-guest.ts        | 118 +++++++++++++++++++++++++++++++++++
+ worker/auth.ts               |  31 ++++++++-
+ worker/d1.ts                 |  17 ++---
+ worker/env.ts                |   2 +
+ worker/index.ts              |  15 ++++-
+ 21 files changed, 427 insertions(+), 38 deletions(-)
+ create mode 100644 migrations/0019_guest.sql
+ create mode 100644 shared/guest.ts
+ create mode 100644 tests/verify-guest.ts
+
+diff --git a/client/src/game/index.ts b/client/src/game/index.ts
+index 943d860..78a988e 100644
+--- a/client/src/game/index.ts
++++ b/client/src/game/index.ts
+@@ -5,6 +5,7 @@ import * as THREE from 'three';
+ import { releaseShadowProbes, shadowProbes } from '../render/shadow-probes';
+ import type { CharacterSummary, ClientMsg, EntityState, ServerMsg, TelegraphMsg } from '../../../shared/protocol';
+ import { ZONES } from '../../../shared/zones';
++import { WAKING_LINE } from '../../../shared/guest';
+ import { isSubmerged, isSwimming } from '../../../shared/terrain';
+ import { breathless } from '../../../shared/tidebound';
+ import { hasQuest } from '../../../shared/frontier';
+@@ -136,7 +137,8 @@ function likelyHeroSpecs(faction: FactionId | 'neutral' | undefined): { race: Ra
+   return out;
+ }
+ 
+-export function startGame(container: HTMLElement, character: CharacterSummary, opts: { onExit: () => void }): { dispose(): void } {
++/** opts.waking: a new guest from Wake now (shared/guest.ts): the first veil reads as the Wakeborn opening their eyes. */
++export function startGame(container: HTMLElement, character: CharacterSummary, opts: { onExit: () => void; waking?: boolean }): { dispose(): void } {
+   const q = new URLSearchParams(location.search);
+   const offline = character.id === -1 || q.has('offline');
+   let stopHeroWarm: (() => void) | null = null;
+@@ -174,13 +176,15 @@ export function startGame(container: HTMLElement, character: CharacterSummary, o
+     'You can invite a friend to your party from the friends list.',
+     'A duel is a fair fight: nobody loses anything but pride.',
+   ];
+-  const makeVeil = (zoneId: string, sub: string, warn = '') => {
++  const makeVeil = (zoneId: string, sub: string, warn = '', title = '') => {
+     const z = ZONES[zoneId];
+-    const v = el('div', 'veil', `<div class="veil-moon"></div><div class="veil-text display">Crossing into ${escapeHtml(z?.name ?? 'Orvandel')}</div><div class="veil-sub">${escapeHtml(sub)}</div><div class="veil-tip">${escapeHtml(TIPS[Math.floor(Math.random() * TIPS.length)])}</div>${warn ? `<div class="veil-warn">${escapeHtml(warn)}</div>` : ''}`);
++    const v = el('div', 'veil', `<div class="veil-moon"></div><div class="veil-text display">${escapeHtml(title || `Crossing into ${z?.name ?? 'Orvandel'}`)}</div><div class="veil-sub">${escapeHtml(sub)}</div><div class="veil-tip">${escapeHtml(TIPS[Math.floor(Math.random() * TIPS.length)])}</div>${warn ? `<div class="veil-warn">${escapeHtml(warn)}</div>` : ''}`);
+     container.appendChild(v);
+     return v;
+   };
+-  let veil = makeVeil(character.zone, offline ? 'Offline preview' : 'Connecting to the world');
++  let veil = opts.waking
++    ? makeVeil(character.zone, `In ${ZONES[character.zone]?.name ?? 'Orvandel'}`, '', `${WAKING_LINE}...`)
++    : makeVeil(character.zone, offline ? 'Offline preview' : 'Connecting to the world');
+ 
+   let world: World | null = null;
+   let ents: EntityManager | null = null;
+diff --git a/client/src/main.ts b/client/src/main.ts
+index bc03883..72d1b79 100644
+--- a/client/src/main.ts
++++ b/client/src/main.ts
+@@ -6,6 +6,7 @@ import './styles/front.css';
+ import { api } from './net/api';
+ import type { AccountInfo, CharacterSummary } from '../../shared/protocol';
+ import { ZONES } from '../../shared/zones';
++import { WAKING_LINE } from '../../shared/guest';
+ import { mountLogin } from './screens/login';
+ import { mountSelect } from './screens/select';
+ import { mountCreator } from './screens/creator';
+@@ -48,6 +49,11 @@ function showLogin() {
+   window.setTimeout(() => { if ('requestIdleCallback' in window) requestIdleCallback(warm, { timeout: 2500 }); else warm(); }, 1200);
+   swap(() => mountLogin(app, {
+     onSignedIn: (acc) => { account = acc; void showSelect(); },
++    // Wake now: a new guest goes straight into the world, past the select screen.
++    // The spare select stage the sign-in screen warmed is not needed: let its GL context go before the world builds.
++    onWake: (acc, c) => { account = acc; writeHeroHint([c]); takeStage()?.dispose(); void enterWorld(c, true); },
++    // The 16+ box was ticked: start fetching the game's code while the visitor reaches for Wake now.
++    onWakeIntent: () => { void import.meta.glob<typeof import('./game/index')>('./game/index.ts')['./game/index.ts']?.().catch(() => undefined); },
+   }));
+ }
+ 
+@@ -101,10 +107,11 @@ async function showCreator(first: boolean) {
+   }));
+ }
+ 
+-async function enterWorld(c: CharacterSummary) {
++/** waking: a new guest from Wake now (the veils read as the Wakeborn opening their eyes). */
++async function enterWorld(c: CharacterSummary, waking = false) {
+   const loading = document.createElement('div');
+   loading.className = 'loading-veil';
+-  loading.innerHTML = `<div class="loading-inner"><p class="display">Waking in ${ZONES[c.zone]?.name ?? 'Orvandel'}</p><div class="loading-crescent"></div></div>`;
++  loading.innerHTML = `<div class="loading-inner"><p class="display">${waking ? `${WAKING_LINE}...` : `Waking in${ZONES[c.zone]?.name ?? 'Orvandel'}`}</p><div class="loading-crescent"></div></div>`;
+   document.body.appendChild(loading);
+   try {
+     // Loaded lazily so the login and creator screens stay small.
+@@ -115,7 +122,7 @@ async function enterWorld(c: CharacterSummary) {
+       const holder = document.createElement('div');
+       holder.className = 'game-root';
+       app.appendChild(holder);
+-      return startGame(holder, c, { onExit: () => void showSelect(c.id) });
++      return startGame(holder, c, { onExit: () => void showSelect(c.id), waking });
+     });
+   } catch (err) {
+     console.error(err);
+diff --git a/client/src/net/api.ts b/client/src/net/api.ts
+index c842f9d..5e8afc8 100644
+--- a/client/src/net/api.ts
++++ b/client/src/net/api.ts
+@@ -36,6 +36,8 @@ export const api = {
+   login: (username: string, password: string) => call<{ account: AccountInfo }>('POST', '/login', { username, password }),
+   /** acceptTerms: the player ticked "I am old enough and accept the terms" (the server stores which version). */
+   register: (username: string, password: string, acceptTerms = false) => call<{ account: AccountInfo; recoveryCode?: string }>('POST', '/register', { username, password, acceptTerms }),
++  /** Wake now: a guest account with one ready hero, signed in at once. acceptTerms: the 16+ and terms box was ticked. */
++  guest: (acceptTerms: boolean) => call<{ account: AccountInfo; character: CharacterSummary }>('POST', '/guest', { acceptTerms }),
+   /** Sets a new password (the current one is asked again) and ends every other session of the account. */
+   changePassword: (current: string, password: string) => call<{ ok: true }>('POST', '/account/password', { current, password }),
+   /** Makes a new recovery code (the password is asked again). The old code stops working; the new one is shown once. */
+diff --git a/client/src/screens/login.ts b/client/src/screens/login.ts
+index 9023f83..e176ec3 100644
+--- a/client/src/screens/login.ts
++++ b/client/src/screens/login.ts
+@@ -1,6 +1,6 @@
+ import { api } from '../net/api';
+ import { WORLD } from '../../../shared/lore';
+-import type { AccountInfo } from '../../../shared/protocol';
++import type { AccountInfo, CharacterSummary } from '../../../shared/protocol';
+ import { brokenMoon } from '../wiki/icons';
+ import type { Screen } from '../main';
+ import { music } from '../game/audio/music';
+@@ -17,7 +17,7 @@ import { showRecoveryCode } from './recovery';
+  * Everything is one painted image, a few CSS layers and one small 2D canvas, so it paints at once.
+  * Pointer movement shifts the layers a few pixels at different depths. Reduced motion freezes all of it.
+  */
+-export function mountLogin(app: HTMLElement, opts: { onSignedIn(acc: AccountInfo): void }): Screen {
++export function mountLogin(app: HTMLElement, opts: { onSignedIn(acc: AccountInfo): void; /** Wake now made a guest and its hero (shared/guest.ts). */ onWake(acc: AccountInfo, c: CharacterSummary): void; /** The Wake now box was ticked: a good moment to fetch the game. */ onWakeIntent?(): void }): Screen {
+   music.setMenu('title');
+   const el = document.createElement('div');
+   el.className = 'screen login';
+@@ -41,6 +41,7 @@ export function mountLogin(app: HTMLElement, opts: { onSignedIn(acc: AccountInfo
+         <p>Orvandel is played with a keyboard and mouse, and phones and tablets are not supported yet, so the world will not play well here. Come back on a computer with a current Chrome, Edge, Firefox or Safari.</p>
+         <p>You can still <a href="/wiki.html">read the wiki</a>, or sign in to manage your account.</p>
+       </aside>
++      <div class="tl-doors">
+       <section class="tl-form" aria-labelledby="login-title">
+         <h2 id="login-title" class="visually-hidden">Sign in</h2>
+         <div class="tl-tabs" role="tablist" aria-label="Sign in or create an account">
+@@ -76,6 +77,15 @@ export function mountLogin(app: HTMLElement, opts: { onSignedIn(acc: AccountInfo
+         <p class="tl-foot">New to this world? <a href="/wiki.html">Read the story of Orvandel</a></p>
+         <p class="tl-foot">Played already? <a href="${FEEDBACK_URL}" target="_blank" rel="noopener">${FEEDBACK_LABEL}</a></p>
+       </section>
++      <section class="tl-wake" data-wake aria-labelledby="wake-title">
++        <h2 id="wake-title" class="tl-wake-title">No account yet</h2>
++        <button class="tl-enter" type="button" data-wake-go disabled><span>Wake now</span></button>
++        <p class="tl-wake-line">Play as a guest. No account needed.</p>
++        <label class="tl-terms"><input type="checkbox" data-wake-terms /> <span>I am ${MIN_AGE} or older, and I accept the <a href="/terms.html" target="_blank" rel="noopener">terms</a> and the <a href="/privacy.html" target="_blank" rel="noopener">privacy policy</a>.</span></label>
++        <p class="form-error" role="alert" aria-live="assertive" data-wake-error></p>
++        <p class="tl-wake-note">Your hero waits a day. Keep it any time by naming an account.</p>
++      </section>
++      </div>
+     </main>
+     <details class="tl-about stone">
+       <summary><span class="tl-beta">Open beta</span> What is Orvandel?</summary>
+@@ -177,6 +187,26 @@ export function mountLogin(app: HTMLElement, opts: { onSignedIn(acc: AccountInfo
+     }
+   });
+ 
++  // Wake now: its own 16+ box (the button stays disabled until it is ticked), then a guest and its hero, straight in.
++  const wakeGo = el.querySelector<HTMLButtonElement>('[data-wake-go]')!;
++  const wakeBox = el.querySelector<HTMLInputElement>('[data-wake-terms]')!;
++  const wakeErr = el.querySelector<HTMLElement>('[data-wake-error]')!;
++  wakeBox.addEventListener('change', () => { wakeGo.disabled = !wakeBox.checked; wakeErr.textContent = ''; if (wakeBox.checked) opts.onWakeIntent?.(); });
++  wakeGo.addEventListener('click', async () => {
++    if (!wakeBox.checked || wakeGo.classList.contains('busy')) return;
++    wakeErr.textContent = '';
++    wakeGo.classList.add('busy');
++    mark('wake:click');
++    try {
++      const res = await api.guest(true);
++      mark('wake:made');
++      opts.onWake(res.account, res.character);
++    } catch (ex: any) {
++      wakeErr.textContent = ex?.message ?? 'Something went wrong.';
++      wakeGo.classList.remove('busy');
++    }
++  });
++
+   el.querySelector('[data-open-reset]')!.addEventListener('click', () => showReset(true));
+   el.querySelector('[data-back]')!.addEventListener('click', () => showReset(false));
+   resetForm.addEventListener('submit', async (e) => {
+diff --git a/client/src/screens/select.ts b/client/src/screens/select.ts
+index 6bfa7fb..1e513a0 100644
+--- a/client/src/screens/select.ts
++++ b/client/src/screens/select.ts
+@@ -80,7 +80,7 @@ export function mountSelect(app: HTMLElement, opts: Opts): Screen {
+       <a class="brand" href="/" aria-label="Orvandel">${brokenMoon(26)}<span class="display">Orvandel</span></a>
+       <nav class="topnav">
+         <a href="/wiki.html" target="_blank" rel="noopener">World wiki</a>
+-        <span class="who">${esc(opts.account.username)}</span>
++        <span class="who">${opts.account.guest ? 'Guest' : esc(opts.account.username)}</span>
+         <button type="button" class="link-btn" data-account>Account</button>
+         <button type="button" class="link-btn" data-logout>Log out</button>
+       </nav>
+diff --git a/client/src/styles/front.css b/client/src/styles/front.css
+index cb2d164..7f1f4f1 100644
+--- a/client/src/styles/front.css
++++ b/client/src/styles/front.css
+@@ -123,6 +123,25 @@
+ .tl-form .tl-enter { width: 100%; margin-top: 4px; }
+ .tl-foot { margin: 16px 0 0; font-size: var(--t-sm); color: var(--moon-2); }
+ .tl-foot a { color: var(--gold); }
++/* Wake now (shared/guest.ts): beside the sign-in form, which stays where it was. Where the about panel leaves no room
++   beside it, it wraps below the form instead of sliding under the panel. */
++.tl-doors {
++  display: flex; flex-wrap: wrap; align-items: center; gap: 28px 48px;
++  max-width: calc(100vw - max(32px, 6.2vw) - min(380px, calc(100vw - 48px)) - max(24px, 3.4vw) - 24px);
++}
++.tl-wake { width: min(280px, calc(100vw - 64px)); padding-left: 40px; border-left: 1px solid rgba(217, 182, 107, 0.22); animation: tl-rise 1.1s var(--ease-out) 0.45s both; }
++.tl-wake-title { margin: 0 0 12px; font-size: var(--t-xs); font-weight: 400; letter-spacing: 0.18em; text-transform: uppercase; color: var(--gold-lo); }
++.tl-wake .tl-enter { width: 100%; }
++.tl-wake .tl-enter:disabled:not(.busy) { opacity: 0.5; cursor: not-allowed; filter: none; background-position: 0 0; }
++.tl-wake-line { margin: 10px 0 12px; font-size: var(--t-md); color: rgba(236, 228, 207, 0.9); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); }
++.tl-wake .form-error { margin: 0 0 8px; }
++.tl-wake .form-error:empty { display: none; }
++.tl-wake-note { margin: 0; font-size: var(--t-xs); color: var(--moon-2); }
++@media (max-width: 900px), (max-height: 640px) {
++  /* The about panel folds to the top here, so the doors take the width and Wake now sits under the form. */
++  .tl-doors { max-width: none; }
++  .tl-wake { width: min(350px, calc(100vw - 64px)); padding: 16px 0 0; border-left: 0; border-top: 1px solid rgba(217, 182, 107, 0.22); }
++}
+ .tl-realm { position: absolute; right: var(--s5); bottom: var(--s4); font-size: var(--t-xs); color: rgba(236, 228, 207, 0.6); display: flex; align-items: center; gap: var(--s2); letter-spacing: 0.08em; }
+ .realm-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+ 
+diff --git a/migrations/0019_guest.sql b/migrations/0019_guest.sql
+new file mode 100644
+index 0000000..b7912da
+--- /dev/null
++++ b/migrations/0019_guest.sql
+@@ -0,0 +1,4 @@
++-- Mirrors server/db.ts migration 19 (2026-10-20 Wake now): a guest account is a normal account with this mark and a
++-- password nobody is told. 1 from the moment Wake now makes it, 0 once the guest keeps the hero by naming the account.
++-- Guests never kept and not played for a day are deleted by the hourly sweep (shared/guest.ts GUEST_STALE_MS).
++ALTER TABLE accounts ADD COLUMN guest INTEGER NOT NULL DEFAULT 0;
+diff --git a/package.json b/package.json
+index 93c219f..33753ff 100644
+--- a/package.json
++++ b/package.json
+@@ -15,7 +15,7 @@
+     "typecheck:cf": "tsc --noEmit -p worker/tsconfig.json",
+     "assets": "node tools/build-characters.mjs",
+     "assets:creatures": "node tools/build-creatures.mjs",
+-    "test": "node -e \"require('fs').mkdirSync('tmp',{recursive:true})\" && tsx tests/cf-check.ts && tsx tests/verify-escape.ts && tsx tests/verify-sim.ts && tsx tests/verify-controls.ts && tsx tests/verify-talents.ts && tsx tests/verify-dreams.ts && tsx tests/verify-firsthour.ts && tsx tests/verify-polish.ts && tsx tests/verify-playtest-mid.ts && tsx tests/verify-server.ts && tsx tests/verify-party.ts && tsx tests/verify-travel.ts && tsx tests/verify-travel2.ts && tsx tests/verify-dungeon.ts && tsx tests/verify-territory-dungeons.ts && tsx tests/verify-social.ts && tsx tests/verify-pvp.ts && tsx tests/verify-qol.ts && tsx tests/verify-swim.ts && tsx tests/verify-underwater.ts && tsx tests/verify-capitals.ts && tsx tests/verify-progression.ts && tsx tests/verify-companions.ts && tsx tests/verify-queue.ts && tsx tests/verify-proving.ts && tsx tests/verify-facing.ts && tsx tests/verify-select.ts && tsx tests/verify-model-urls.ts && tsx tests/verify-mounts.ts && tsx tests/verify-mounts2.ts && tsx tests/verify-flying.ts && tsx tests/verify-q7.ts && tsx tests/verify-raid.ts && tsx tests/verify-instance-map.ts && tsx tests/verify-secrets.ts && tsx tests/verify-frontier.ts && tsx tests/verify-signatures.ts && tsx tests/verify-signature-quests.ts && tsx tests/verify-pyreborn.ts && tsx tests/verify-wildshaper.ts && tsx tests/verify-balance.ts && tsx tests/verify-reactive.ts && tsx tests/verify-combatfeel.ts && tsx tests/verify-rhythm.ts && tsx tests/verify-friends.ts && tsx tests/verify-report.ts && tsx tests/verify-launch.ts && tsx tests/verify-membership.ts && tsx tests/verify-recovery.ts && tsx tests/verify-admin.ts && tsx tests/verify-originality.ts && tsx tests/verify-audio.ts && tsx tests/verify-discovery.ts && tsx tests/verify-hunts.ts && tsx tests/verify-chests.ts && tsx tests/verify-bars.ts && tsx tests/verify-playtest2.ts && tsx tests/verify-upkeep.ts && tsx tests/footprint-check.ts && tsx tests/verify-chapter2.ts && tsx tests/verify-chapter3.ts && tsx tests/verify-questflow.ts && tsx tests/pacing-model.ts && tsx tests/camp-eval.ts",
++    "test": "node -e \"require('fs').mkdirSync('tmp',{recursive:true})\" && tsx tests/cf-check.ts && tsx tests/verify-escape.ts && tsx tests/verify-sim.ts && tsx tests/verify-controls.ts && tsx tests/verify-talents.ts && tsx tests/verify-dreams.ts && tsx tests/verify-firsthour.ts && tsx tests/verify-polish.ts && tsx tests/verify-playtest-mid.ts && tsx tests/verify-server.ts && tsx tests/verify-party.ts && tsx tests/verify-travel.ts && tsx tests/verify-travel2.ts && tsx tests/verify-dungeon.ts && tsx tests/verify-territory-dungeons.ts && tsx tests/verify-social.ts && tsx tests/verify-pvp.ts && tsx tests/verify-qol.ts && tsx tests/verify-swim.ts && tsx tests/verify-underwater.ts && tsx tests/verify-capitals.ts && tsx tests/verify-progression.ts && tsx tests/verify-companions.ts && tsx tests/verify-queue.ts && tsx tests/verify-proving.ts && tsx tests/verify-facing.ts && tsx tests/verify-select.ts && tsx tests/verify-model-urls.ts && tsx tests/verify-mounts.ts && tsx tests/verify-mounts2.ts && tsx tests/verify-flying.ts && tsx tests/verify-q7.ts && tsx tests/verify-raid.ts && tsx tests/verify-instance-map.ts && tsx tests/verify-secrets.ts && tsx tests/verify-frontier.ts && tsx tests/verify-signatures.ts && tsx tests/verify-signature-quests.ts && tsx tests/verify-pyreborn.ts && tsx tests/verify-wildshaper.ts && tsx tests/verify-balance.ts && tsx tests/verify-reactive.ts && tsx tests/verify-combatfeel.ts && tsx tests/verify-rhythm.ts && tsx tests/verify-friends.ts && tsx tests/verify-report.ts && tsx tests/verify-launch.ts && tsx tests/verify-membership.ts && tsx tests/verify-recovery.ts && tsx tests/verify-guest.ts && tsx tests/verify-admin.ts && tsx tests/verify-originality.ts && tsx tests/verify-audio.ts && tsx tests/verify-discovery.ts && tsx tests/verify-hunts.ts && tsx tests/verify-chests.ts && tsx tests/verify-bars.ts && tsx tests/verify-playtest2.ts && tsx tests/verify-upkeep.ts && tsx tests/footprint-check.ts && tsx tests/verify-chapter2.ts && tsx tests/verify-chapter3.ts && tsx tests/verify-questflow.ts && tsx tests/pacing-model.ts && tsx tests/camp-eval.ts",
+     "test:play": "tsx tests/playthrough.ts",
+     "test:elite": "tsx tests/elite-duel.ts",
+     "test:balance": "tsx tests/balance-sim.ts",
+diff --git a/server/api.ts b/server/api.ts
+index a343173..02a7595 100644
+--- a/server/api.ts
++++ b/server/api.ts
+@@ -3,7 +3,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
+ import {
+   accountFromRequest, allowAuthAttempt, allowResetAttempt, changePassword, checkAccountPassword, clearCookie, clientIp, destroySession, login,
+   allowAdminAttempt, allowRedeemAttempt, makeRecoveryCode, recoveryState, register, resetPassword, sessionCookie, sessionToken,
++  allowGuestAttempt, createGuest,
+ } from './auth';
++import { GUEST_LIMITED } from '../shared/guest';
+ import { RESET_LIMITED } from './recovery-rules';
+ import { COMP_LIMITED, COMP_WRONG, compCodeMatches, compCodesFrom, compGrant } from './comp-rules';
+ import { accountData, adminSql, billing, characters, reports, site, type CharacterRecord } from './db';
+@@ -193,7 +195,17 @@ async function route(req: IncomingMessage, res: ServerResponse, world: World): P
+     return sendJson(res, 202, { ok: true });
+   }
+ 
+-  if ((path === '/api/register' || path === '/api/login') && method === 'POST' && site.status().closed) throw new HttpError(503, CLOSED_TEXT);
++  if ((path === '/api/register' || path === '/api/login' || path === '/api/guest') && method === 'POST' && site.status().closed) throw new HttpError(503, CLOSED_TEXT);
++
++  // Wake now (shared/guest.ts): the 16+ box, then 3 guests per address per hour, then a guest account, its hero and a session.
++  if (path === '/api/guest' && method === 'POST') {
++    const b = await readJson(req);
++    if (!termsAccepted(b)) throw new HttpError(400, TERMS_REQUIRED);
++    if (!allowGuestAttempt(clientIp(req))) throw new HttpError(429, GUEST_LIMITED);
++    const r = await createGuest(termsAccepted(b));
++    if (!r.ok) throw new HttpError(r.status, r.error);
++    return sendJson(res, 201, { account: r.account, character: summary(r.character) }, { 'Set-Cookie': sessionCookie(r.token) });
++  }
+ 
+   if (path === '/api/register' && method === 'POST') {
+     if (!allowAuthAttempt(clientIp(req))) throw new HttpError(429, 'Too many attempts. Try again in a few minutes.');
+diff --git a/server/auth-rules.ts b/server/auth-rules.ts
+index 92d49fc..8f71e08 100644
+--- a/server/auth-rules.ts
++++ b/server/auth-rules.ts
+@@ -1,5 +1,6 @@
+ // Account and session rules shared by the Node server (auth.ts) and the Cloudflare Worker (worker/).
+ // Pure: no Node built-ins, no storage, only Web APIs available in both runtimes.
++import { GUEST_NAME_RESERVED, isGuestName } from '../shared/guest';
+ 
+ export const COOKIE_NAME = 'sid';
+ export const SESSION_MS = 30 * 24 * 3600 * 1000;
+@@ -9,6 +10,7 @@ export const RATE_WINDOW_MS = 5 * 60 * 1000;
+ 
+ export function validateCredentials(username: unknown, password: unknown): string | null {
+   if (typeof username !== 'string' || !USERNAME_RE.test(username)) return 'Usernames are 3 to 20 letters, digits or underscores.';
++  if (isGuestName(username)) return GUEST_NAME_RESERVED;
+   if (typeof password !== 'string' || password.length < 8) return 'Passwords need at least 8 characters.';
+   if (password.length > 256) return 'That password is too long.';
+   return null;
+diff --git a/server/auth.ts b/server/auth.ts
+index c151fb6..eabc9ff 100644
+--- a/server/auth.ts
++++ b/server/auth.ts
+@@ -2,7 +2,7 @@
+ // The rules shared with the Cloudflare Worker live in auth-rules.ts and password.ts.
+ import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+ import type { IncomingMessage } from 'node:http';
+-import { accounts, sessions, site, type AccountRecord } from './db';
++import { accountData, accounts, characters, sessions, site, type AccountRecord, type CharacterRecord } from './db';
+ import type { AccountInfo } from '../shared/protocol';
+ import {
+   allowAttempt, BAD_LOGIN, clearCookieFor, COOKIE_NAME, loginShapeOk, parseCookies as parseCookieHeader, SESSION_MS,
+@@ -13,6 +13,9 @@ import {
+   BAD_CURRENT_PASSWORD, BAD_RESET, newRecoveryCode, normalizeRecoveryCode, RESET_LIMITED, RESET_RATE_DEFAULT, validateNewPassword,
+ } from './recovery-rules';
+ import { ADMIN_RATE_DEFAULT } from './admin-rules';
++import { allowPerHour } from './site-rules';
++import { GUEST_FAILED, GUEST_PER_HOUR, guestSecret, guestUsername } from '../shared/guest';
++import { createGuestCharacter } from './characters';
+ 
+ export { COOKIE_NAME };
+ 
+@@ -94,6 +97,14 @@ export function allowAdminAttempt(ip: string): boolean {
+   return allowAttempt(adminByIp, ip, Number(process.env.ADMIN_RATE_LIMIT ?? ADMIN_RATE_DEFAULT) || ADMIN_RATE_DEFAULT);
+ }
+ 
++// Wake now (shared/guest.ts): guests one address may make per hour, stricter than sign-up. GUEST_RATE_LIMIT overrides it.
++const guestByIp = new Map<string, number[]>();
++
++/** Records a guest creation; false when this IP has made its share this hour. */
++export function allowGuestAttempt(ip: string): boolean {
++  return allowPerHour(guestByIp, ip, Number(process.env.GUEST_RATE_LIMIT ?? GUEST_PER_HOUR) || GUEST_PER_HOUR);
++}
++
+ setInterval(() => {
+   const now = Date.now();
+   for (const m of [attempts, resetByIp, resetByName, redeemByIp, redeemByAccount, adminByIp]) for (const [k, list] of m) if (!list.some((t) => now - t < 5 * 60 * 1000)) m.delete(k);
+@@ -123,6 +134,27 @@ export async function register(username: unknown, password: unknown, terms = '')
+   return { ok: true, account: info(acc), token: createSession(acc.id), recoveryCode };
+ }
+ 
++export type GuestResult = { ok: true; account: AccountInfo; token: string; character: CharacterRecord } | { ok: false; status: number; error: string };
++
++/**
++ * Wake now: a guest account (guest_ and random letters, a secret password hashed as usual and told to nobody, no recovery
++ * code) with one ready hero, and a session. 	erms: the version the visitor accepted (the caller has checked the box).
++ */
++export async function createGuest(terms: string): Promise<GuestResult> {
++  const hash = await hashPassword(guestSecret());
++  let acc: AccountRecord | null = null;
++  for (let i = 0; i < 3 && !acc; i++) acc = accounts.create(guestUsername(), hash, terms, '', true);
++  if (!acc) return { ok: false, status: 503, error: GUEST_FAILED };
++  const id = acc.id;
++  const character = await createGuestCharacter(id, {
++    nameTaken: (name) => characters.nameTaken(name),
++    lookalike: (key, name) => characters.lookalikeTaken(key, name),
++    create: (c) => characters.create(c),
++  });
++  if (!character) { accountData.delete(id); return { ok: false, status: 503, error: GUEST_FAILED }; }
++  return { ok: true, account: info(acc), token: createSession(id), character };
++}
++
+ export async function login(username: unknown, password: unknown): Promise<AuthResult> {
+   if (!loginShapeOk(username, password)) return { ok: false, status: 401, error: BAD_LOGIN };
+   const acc = USERNAME_RE.test(username) ? accounts.byName(username) : null;
+@@ -189,7 +221,7 @@ export async function resetPassword(
+ export { RESET_LIMITED };
+ 
+ function info(a: AccountRecord): AccountInfo {
+-  return { id: a.id, username: a.username };
++  return { id: a.id, username: a.username, ...(a.guest ? { guest: true as const } : {}) };
+ }
+ 
+ function createSession(accountId: number): string {
+@@ -217,7 +249,7 @@ export function accountFromRequest(req: IncomingMessage): AccountInfo | null {
+   const token = sessionToken(req);
+   if (!token) return null;
+   const s = sessions.get(sha256(token));
+-  return s ? { id: s.accountId, username: s.username } : null;
++  return s ? { id: s.accountId, username: s.username, ...(s.guest ? { guest: true as const } : {}) } : null;
+ }
+ 
+ const secure = () => process.env.NODE_ENV === 'production';
+diff --git a/server/characters.ts b/server/characters.ts
+index 3df6028..f10fc0e 100644
+--- a/server/characters.ts
++++ b/server/characters.ts
+@@ -11,6 +11,7 @@ import type { CharacterSummary, InventorySlot } from '../shared/protocol';
+ import { BASE_CHARACTER_SLOTS, MEMBERSHIP_NAME, MEMBER_EXTRA_SLOTS } from '../shared/membership';
+ import { GEAR_ROLES, PROVING_BAGS, PROVING_COPPER, PROVING_LEVEL, PROVING_MAX_CHARACTERS, PROVING_TALENTS, PROVING_ZONE, gearRolesFor, mainGearRole, provingCompleted, provingSet, type GearRole } from '../shared/proving';
+ import { LOOKALIKE_NAME, nameKey } from '../shared/social';
++import { guestBlueprint, guestNameCandidates } from '../shared/guest';
+ import { NAME_REFUSED, nameRefused } from './chat-filter';
+ import type { CharacterRecord, InstanceSave, NewCharacter } from './db';
+ import { INVENTORY_SIZE } from './world/constants';
+@@ -163,3 +164,23 @@ export function newCharacterFrom(
+     inventory, equipment, quests: [], completed: [],
+   };
+ }
++
++/**
++ * Wake now: the one ready hero of a new guest (shared/guest.ts), a level 1 Human Vanguard with a random look, under the
++ * first free name from guestNameCandidates. `create` stores it and returns null when the name was taken meanwhile (the
++ * UNIQUE constraint). Null when every candidate was taken, which the caller treats as a failed wake.
++ */
++export async function createGuestCharacter(
++  accountId: number,
++  store: { nameTaken(name: string): boolean | Promise<boolean>; lookalike(key: string, name: string): boolean | Promise<boolean>; create(c: NewCharacter): CharacterRecord | null | Promise<CharacterRecord | null> },
++  rnd: () => number = Math.random,
++): Promise<CharacterRecord | null> {
++  for (const name of guestNameCandidates(rnd)) {
++    if (nameRefused(name) || (await store.nameTaken(name)) || (await store.lookalike(nameKey(name), name))) continue;
++    let fresh: NewCharacter;
++    try { fresh = newCharacterFrom(accountId, guestBlueprint(name, rnd), { count: 0, nameTaken: () => false }); } catch { continue; }
++    const rec = await store.create(fresh);
++    if (rec) return rec;
++  }
++  return null;
++}
+diff --git a/server/db.ts b/server/db.ts
+index 886db59..bf15483 100644
+--- a/server/db.ts
++++ b/server/db.ts
+@@ -25,7 +25,7 @@ import type { AdminSql } from './admin-rules';
+ /** What GET /api/account/export returns: everything stored about one account (both backends build this shape). */
+ export interface AccountExport {
+   /** terms: the version of the terms accepted when the account was made ('' if none was recorded). */
+-  account: { username: string; createdAt: number; terms: string };
++  account: { username: string; createdAt: number; terms: string; /** A Wake now guest not yet kept. */ guest: boolean };
+   characters: Omit<CharacterRecord, 'accountId'>[];
+   friends: { character: number; kind: string; name: string; since: number }[];
+   reports: { createdAt: number; characterId: number; text: string; context: unknown }[];
+@@ -84,7 +84,7 @@ export interface SocialRow {
+ }
+ 
+ /** recoveryHash: a slow hash of the recovery code, '' when the account has none; recoveryAt: when it was made (ms). */
+-export interface AccountRecord { id: number; username: string; passHash: string; createdAt: number; recoveryHash: string; recoveryAt: number }
++export interface AccountRecord { id: number; username: string; passHash: string; createdAt: number; recoveryHash: string; recoveryAt: number; /** A Wake now guest not yet kept (shared/guest.ts). */ guest: boolean }
+ 
+ export interface CharacterRecord {
+   id: number;
+@@ -281,6 +281,9 @@ const MIGRATIONS: string[] = [
+   // 2026-10-16 upkeep: the quest pouch, quest items kept out of the bags as a JSON list of stacks. Older saves keep their
+   // quest items in the inventory column, and the world moves them to the pouch the first time it loads them.
+   `ALTER TABLE characters ADD COLUMN pouch TEXT NOT NULL DEFAULT '[]';`,
++  // 2026-10-20 Wake now: a guest account (shared/guest.ts) is a normal account with this mark and a password nobody is
++  // told. 1 from creation, 0 once the guest keeps the hero by naming the account.
++  `ALTER TABLE accounts ADD COLUMN guest INTEGER NOT NULL DEFAULT 0;`,
+ ];
+ 
+ let db: DatabaseSync;
+@@ -336,11 +339,11 @@ function migrate(): void {
+ function prepareAll() {
+   const p = (sql: string): StatementSync => db.prepare(sql);
+   return {
+-    accountInsert: p('INSERT INTO accounts (username, pass_hash, created_at, terms, recovery_hash, recovery_at) VALUES (?, ?, ?, ?, ?, ?)'),
++    accountInsert: p('INSERT INTO accounts (username, pass_hash, created_at, terms, recovery_hash, recovery_at, guest) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+     accountByName: p('SELECT * FROM accounts WHERE username = ?'),
+     accountById: p('SELECT * FROM accounts WHERE id = ?'),
+     sessionInsert: p('INSERT INTO sessions (token_hash, account_id, expires_at) VALUES (?, ?, ?)'),
+-    sessionGet: p('SELECT s.account_id, s.expires_at, a.username FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.token_hash = ?'),
++    sessionGet: p('SELECT s.account_id, s.expires_at, a.username, a.guest FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.token_hash = ?'),
+     sessionDelete: p('DELETE FROM sessions WHERE token_hash = ?'),
+     purgeSessions: p('DELETE FROM sessions WHERE expires_at < ?'),
+     charsByAccount: p('SELECT * FROM characters WHERE account_id = ? ORDER BY last_played DESC, id ASC'),
+@@ -374,7 +377,7 @@ function json<T>(v: unknown, fallback: T): T {
+ function toAccount(r: Row): AccountRecord {
+   return {
+     id: Number(r.id), username: String(r.username), passHash: String(r.pass_hash), createdAt: Number(r.created_at),
+-    recoveryHash: String(r.recovery_hash ?? ''), recoveryAt: Number(r.recovery_at ?? 0),
++    recoveryHash: String(r.recovery_hash ?? ''), recoveryAt: Number(r.recovery_at ?? 0), guest: Number(r.guest ?? 0) === 1,
+   };
+ }
+ 
+@@ -425,11 +428,12 @@ function toCharacter(r: Row): CharacterRecord {
+ // ---------- Repositories ----------
+ 
+ export const accounts = {
+-  create(username: string, passHash: string, terms = '', recoveryHash = ''): AccountRecord | null {
++  /** guest: a Wake now account (shared/guest.ts). */
++  create(username: string, passHash: string, terms = '', recoveryHash = '', guest = false): AccountRecord | null {
+     try {
+       const now = Date.now();
+-      const res = stmts.accountInsert.run(username, passHash, now, terms, recoveryHash, recoveryHash ? now : 0);
+-      return { id: Number(res.lastInsertRowid), username, passHash, createdAt: now, recoveryHash, recoveryAt: recoveryHash ? now : 0 };
++      const res = stmts.accountInsert.run(username, passHash, now, terms, recoveryHash, recoveryHash ? now : 0, guest ? 1 : 0);
++      return { id: Number(res.lastInsertRowid), username, passHash, createdAt: now, recoveryHash, recoveryAt: recoveryHash ? now : 0, guest };
+     } catch (err) {
+       if (String(err).includes('UNIQUE')) return null;
+       throw err;
+@@ -469,14 +473,14 @@ export const sessions = {
+     stmts.sessionInsert.run(tokenHash, accountId, expiresAt);
+   },
+   /** Returns the account for a live session, deleting it if expired. */
+-  get(tokenHash: string): { accountId: number; username: string } | null {
++  get(tokenHash: string): { accountId: number; username: string; guest: boolean } | null {
+     const r = stmts.sessionGet.get(tokenHash) as Row | undefined;
+     if (!r) return null;
+     if (Number(r.expires_at) < Date.now()) {
+       stmts.sessionDelete.run(tokenHash);
+       return null;
+     }
+-    return { accountId: Number(r.account_id), username: String(r.username) };
++    return { accountId: Number(r.account_id), username: String(r.username), guest: Number(r.guest ?? 0) === 1 };
+   },
+   delete(tokenHash: string): void {
+     stmts.sessionDelete.run(tokenHash);
+@@ -630,7 +634,7 @@ export const accountData = {
+     const reps = db.prepare('SELECT created_at, character_id, text, context FROM reports WHERE account_id = ? ORDER BY id').all(accountId) as Row[];
+     const terms = String((db.prepare('SELECT terms FROM accounts WHERE id = ?').get(accountId) as Row | undefined)?.terms ?? '');
+     return {
+-      account: { username: acc.username, createdAt: acc.createdAt, terms },
++      account: { username: acc.username, createdAt: acc.createdAt, terms, guest: acc.guest },
+       characters: chars.map(({ accountId: _a, ...c }) => c),
+       friends,
+       reports: reps.map((r) => ({ createdAt: Number(r.created_at), characterId: Number(r.character_id), text: String(r.text), context: json(r.context, {}) })),
+diff --git a/shared/guest.ts b/shared/guest.ts
+new file mode 100644
+index 0000000..78fb6a9
+--- /dev/null
++++ b/shared/guest.ts
+@@ -0,0 +1,81 @@
++// Wake now: a visitor plays at once as a guest, a normal account with a guest mark and a password nobody is told.
++// The rules shared by the Node server, the Cloudflare Worker and the client. Pure: no storage, no Node built-ins.
++import { randomAppearance } from './appearance';
++import { RACES } from './lore';
++
++/** Every guest account name starts with this, and no other account may (auth-rules.ts validateCredentials). */
++export const GUEST_PREFIX = 'guest_';
++/** Guests one address may make per hour: stricter than sign-up (10 attempts per 5 minutes). GUEST_RATE_LIMIT overrides it. */
++export const GUEST_PER_HOUR = 3;
++/** A guest never kept is deleted once none of its characters has been played for this long (and the account is as old). */
++export const GUEST_STALE_MS = 24 * 3600_000;
++/** How often the sweep looks for stale guests. */
++export const GUEST_SWEEP_EVERY_MS = 3600_000;
++
++/** The one line a guest meets at every door kept for named accounts. */
++export const GUEST_REFUSED = 'Keep your hero first: name an account to go here.';
++export const GUEST_LIMITED = 'Too many guests from this address. Try again in an hour, or make an account.';
++export const GUEST_FAILED = 'The realm could not make a guest right now. Try again in a moment.';
++export const GUEST_NAME_RESERVED = 'Account names cannot start with guest_.';
++/** Keep this hero asked of an account that is not a guest. */
++export const NOT_A_GUEST = 'This account already has a name.';
++
++/** The hero every guest wakes as: a Human Vanguard of the Concord, who starts in Lanternfield. */
++export const GUEST_HERO = { faction: 'concord', race: 'human', cls: 'vanguard' } as const;
++
++const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
++
++/** guest_ and 10 random base32 letters and digits: fits the account name rule (3 to 20 letters, digits or underscores). */
++export function guestUsername(bytes: Uint8Array = crypto.getRandomValues(new Uint8Array(10))): string {
++  let s = GUEST_PREFIX;
++  for (let i = 0; i < 10; i++) s += BASE32[bytes[i % bytes.length] & 31];
++  return s;
++}
++
++/** A secret password for a new guest. It is hashed like any password and never told to anyone, logged or returned. */
++export function guestSecret(): string {
++  const b = crypto.getRandomValues(new Uint8Array(24));
++  let s = '';
++  for (const x of b) s += x.toString(16).padStart(2, '0');
++  return s;
++}
++
++export function isGuestName(username: unknown): boolean {
++  return typeof username === 'string' && username.toLowerCase().startsWith(GUEST_PREFIX);
++}
++
++/** The refusal a gate shows a guest, or null for a named account. */
++export function guestRefusal(guest: boolean | undefined): string | null {
++  return guest ? GUEST_REFUSED : null;
++}
++
++// Syllables in the sound of the Concord's own names (shared/lore.ts human names), for when those few names are taken.
++const HEADS = ['Al', 'Ma', 'To', 'E', 'Cor', 'Sa', 'Ro', 'I', 'Da', 'Lu', 'Bren', 'Ha', 'Ce', 'Ves', 'Ori', 'Wil', 'Ca', 'Mer'];
++const JOINS = ['r', 'l', 'n', 'v', 's', 'm', 'd', 'th', 'b'];
++const VOWELS = ['a', 'e', 'i', 'o'];
++const TAILS = ['ic', 'a', 'in', 'ise', 'ine', 'an', 'en', 'el', 'is', 'or', 'yn', 'eth', 'ard', 'ia', 'ric', 'win'];
++
++/**
++ * Names to try for a guest's hero, in order: one of the Concord's human names first, then made ones from the same sounds,
++ * longer towards the end of the list so a crowded realm still finds a free one. Each passes the name rule
++ * (shared/appearance.ts validateName: 3 to 16 letters, a capital first).
++ */
++export function guestNameCandidates(rnd: () => number = Math.random, n = 8): string[] {
++  const pick = <T>(a: readonly T[]) => a[Math.floor(rnd() * a.length)];
++  const human = RACES.human.names.first;
++  const out = [pick(human)];
++  while (out.length < n) {
++    const long = out.length >= n / 2;
++    const name = pick(HEADS) + pick(JOINS) + (long ? pick(VOWELS) + pick(JOINS) : '') + pick(TAILS);
++    if (!out.includes(name)) out.push(name);
++  }
++  return out;
++}
++
++/** The create-character body for a guest's hero with this name: the fixed people and calling, a random look. */
++export function guestBlueprint(name: string, rnd: () => number = Math.random): Record<string, unknown> {
++  return { name, ...GUEST_HERO, appearance: randomAppearance(GUEST_HERO.race, rnd) };
++}
++
++/** The line on the loading veil while a guest wakes (the Wakeborn open their eyes in a body already theirs). */
++export const WAKING_LINE = 'You open your eyes';
+diff --git a/shared/protocol.ts b/shared/protocol.ts
+index ba55780..cfc245e 100644
+--- a/shared/protocol.ts
++++ b/shared/protocol.ts
+@@ -20,6 +20,7 @@ export type QueueState = 'idle' | 'queued' | 'proposed' | 'entering';
+ // ---------- REST (all under /api, JSON, cookie session) ----------
+ // POST /api/register   { username, password }            -> { account, recoveryCode }  (the code is shown once; only its hash is stored)
+ // POST /api/login      { username, password }            -> { account }
++// POST /api/guest      { acceptTerms }                   -> { account (guest: true), character }  (Wake now; 3 per address per hour)
+ // POST /api/logout                                       -> { ok }
+ // GET  /api/me                                           -> { account, membership, recovery: { exists, createdAt } } | 401
+ // POST /api/account/password { current, password }       -> { ok }  (ends every other session)
+@@ -31,7 +32,8 @@ export type QueueState = 'idle' | 'queued' | 'proposed' | 'entering';
+ // DELETE /api/characters/:id                             -> { ok }
+ // Errors: non-2xx with { error: string } for the user to read.
+ 
+-export interface AccountInfo { id: number; username: string }
++/** guest: a Wake now account (shared/guest.ts), present only while true. */
++export interface AccountInfo { id: number; username: string; guest?: true }
+ 
+ // ---------- Wakeborn Membership (shared/membership.ts) ----------
+ // Kept in this one block so it merges cleanly beside other protocol work.
+diff --git a/tests/cf-check.ts b/tests/cf-check.ts
+index d5019f0..bccc768 100644
+--- a/tests/cf-check.ts
++++ b/tests/cf-check.ts
+@@ -247,6 +247,14 @@ await d1.sessions.create('h1', acc.id, Date.now() + 60_000);
+ await d1.sessions.create('h2', acc.id, Date.now() - 1);
+ if ((await d1.sessions.get('h1'))?.username !== 'Parity_User') fail('D1 session lookup');
+ if (await d1.sessions.get('h2')) fail('D1 returned an expired session');
++// Wake now (shared/guest.ts): the guest mark is stored, read back on the account and on its session; a normal account has none.
++{
++  const g = (await d1.accounts.create('guest_paritycheck', 'x', '2026-10-01', '', true))!;
++  await d1.sessions.create('hg', g.id, Date.now() + 60_000);
++  const marks = [g.guest, (await d1.accounts.byId(g.id))?.guest, (await d1.sessions.get('hg'))?.guest, (await d1.accounts.byId(acc.id))?.guest, (await d1.sessions.get('h1'))?.guest, (await d1.accountData.export(g.id))?.account.guest];
++  if (JSON.stringify(marks) !== '[true,true,true,false,false,true]') fail(`D1 guest mark: ${JSON.stringify(marks)}`);
++  else log('guest mark: D1 stores it and reads it back on the account, its session and its export; a normal account has none');
++}
+ const fresh = (await d1.characters.create(newCharacterFrom(acc.id, body, { count: 0, nameTaken: () => false })))!;
+ if (!fresh || !Array.isArray(fresh.talents)) fail(`D1 create did not return a full record: ${JSON.stringify(fresh)}`);
+ if (await d1.characters.create(newCharacterFrom(acc.id, { ...body }, { count: 0, nameTaken: () => false }))) fail('D1 accepted a duplicate character name');
+diff --git a/tests/verify-guest.ts b/tests/verify-guest.ts
+new file mode 100644
+index 0000000..cbab772
+--- /dev/null
++++ b/tests/verify-guest.ts
+@@ -0,0 +1,118 @@
++// Wake now (shared/guest.ts) on the Node server, on the virtual clock (so the hourly limit is exact).
++// Covers: a guest made with one click (the 16+ box required), its hero (a level 1 Human Vanguard in Lanternfield with a
++// valid, unique name and a random body type), the session it gets and keeps across a reload, the secret password never
++// returned and no recovery code, the per-address limit of 3 an hour (and the hour ending), refusal while the realm is
++// closed, the CSRF check, and the reserved guest_ prefix for sign-up.
++// Run: npx tsx tests/verify-guest.ts
++import { endProcess } from './exit';
++import { rmSync } from 'node:fs';
++import { resolve } from 'node:path';
++import { advance, installVirtualClock } from './vclock';
++import { GUEST_LIMITED, GUEST_PER_HOUR, GUEST_REFUSED, guestNameCandidates, guestUsername, isGuestName } from '../shared/guest';
++import { validateName } from '../shared/appearance';
++import { ZONES } from '../shared/zones';
++import { USERNAME_RE } from '../server/auth-rules';
++
++installVirtualClock(4242);
++// The test names the client address itself, so every phase has its own IP and its own limits.
++process.env.TRUST_PROXY = '1';
++const { startServer } = await import('../server/app');
++const { accounts, characters, site } = await import('../server/db');
++
++const DB = resolve(`tmp/guest-${process.pid}.db`);
++let failures = 0;
++const check = (ok: boolean, text: string) => { if (!ok) failures++; console.log(`${ok ? 'ok  ' : 'FAIL'} ${text}`); };
++
++const srv = await startServer({ port: 0, dbFile: DB });
++const base = `http://localhost:${srv.port}`;
++async function call(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
++  const send = () => fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
++  // Advancing the virtual clock fires the server's socket timers, which can drop a kept-alive connection: try once more.
++  const r = await send().catch(() => send());
++  const text = await r.text();
++  let json: any = null;
++  try { json = JSON.parse(text); } catch { /* not JSON */ }
++  return { status: r.status, json, text, cookie: (r.headers.get('set-cookie') ?? '').split(';')[0] };
++}
++let ipN = 0;
++const freshIp = () => `10.7.${Math.floor(++ipN / 250)}.${ipN % 250}`;
++const from = (ip: string, cookie = '') => ({ 'X-Forwarded-For': ip, ...(cookie ? { Cookie: cookie } : {}) });
++const wake = (ip: string, acceptTerms: unknown = true, extra: Record<string, string> = {}) => call('POST', '/api/guest', { acceptTerms }, { ...from(ip), ...extra });
++
++// ---------- The rules ----------
++const names = Array.from({ length: 50 }, (_, i) => guestUsername(new Uint8Array(Array.from({ length: 10 }, (_, j) => (i * 31 + j * 7) & 255))));
++check(names.every((n) => USERNAME_RE.test(n) && n.length === 16 && isGuestName(n)), 'guest account names fit the account name rule and carry the guest_ prefix');
++check(new Set(Array.from({ length: 200 }, () => guestUsername())).size === 200, 'random guest account names do not repeat');
++let seed = 1;
++const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
++const cands = Array.from({ length: 40 }, () => guestNameCandidates(rnd)).flat();
++check(cands.every((n) => validateName(n) === null), `every candidate hero name passes the name rule (${cands.slice(0, 8).join(', ')}, ...)`);
++check(GUEST_PER_HOUR === 3 && GUEST_REFUSED.length > 0 && !/[\u2013\u2014!]/.test(GUEST_REFUSED + GUEST_LIMITED), 'three guests an hour; the lines have no dashes or exclamation marks');
++
++// ---------- Wake now: one click, a guest, its hero and a session ----------
++const ipA = freshIp();
++const unticked = await wake(ipA, false);
++check(unticked.status === 400 && /16 or older/.test(unticked.json?.error ?? '') && !unticked.cookie, 'without the 16+ box ticked no guest is made and no session is given');
++check((await wake(ipA, 'yes')).status === 400, 'only a real tick counts (a string is not true)');
++const a = await wake(ipA);
++check(a.status === 201 && a.json?.account?.guest === true && isGuestName(a.json?.account?.username) && !!a.cookie, `Wake now answers 201 with a guest account and a session (${a.json?.account?.username})`);
++check(!('recoveryCode' in (a.json ?? {})) && !/password|pass_hash|secret|scrypt/i.test(a.text), 'the answer carries no password, hash or recovery code');
++const hero = a.json?.character;
++check(hero?.race === 'human' && hero?.cls === 'vanguard' && hero?.faction === 'concord' && hero?.level === 1, 'the hero is a level 1 Human Vanguard of the Concord');
++check(ZONES[hero?.zone]?.name === 'Lanternfield', `and stands in Lanternfield (${hero?.zone})`);
++check(validateName(hero?.name ?? '') === null && characters.nameTaken(hero.name), `its name is valid and stored (${hero?.name})`);
++check(hero?.appearance?.bodyType === 0 || hero?.appearance?.bodyType === 1, 'its body type is one of the two');
++const rec = accounts.byName(a.json.account.username)!;
++check(rec.guest === true && rec.passHash.startsWith('scrypt$') && rec.recoveryHash === '', 'stored: the guest mark, a hashed secret password, no recovery code');
++check((await call('POST', '/api/login', { username: rec.username, password: '' }, from(freshIp()))).status === 401, 'the guest account cannot be signed into without its secret');
++
++// Reloading the page: the same cookie is the same guest with the same hero.
++const ses = await call('GET', '/api/session', undefined, from(ipA, a.cookie));
++check(ses.status === 200 && ses.json?.account?.id === a.json.account.id && ses.json.account.guest === true, 'reloading: /api/session says the same guest');
++const me = await call('GET', '/api/me', undefined, from(ipA, a.cookie));
++check(me.status === 200 && me.json?.account?.guest === true, '/api/me marks the account as a guest');
++const list = await call('GET', '/api/characters', undefined, from(ipA, a.cookie));
++check(list.status === 200 && list.json?.characters?.length === 1 && list.json.characters[0].id === hero.id && list.json.characters[0].name === hero.name, 'and its one hero is listed');
++const exp = await call('GET', '/api/account/export', undefined, from(ipA, a.cookie));
++check(exp.json?.account?.guest === true && !/scrypt|pass/i.test(exp.text), 'the export says it is a guest, with no hash');
++
++// A named account is not marked.
++const named = await call('POST', '/api/register', { username: 'wakerofnone', password: 'a long password', acceptTerms: true }, from(freshIp()));
++const namedSes = await call('GET', '/api/session', undefined, from(freshIp(), named.cookie));
++check(named.status === 201 && !('guest' in named.json.account) && !('guest' in namedSes.json.account), 'a normal account carries no guest mark');
++check((await call('POST', '/api/register', { username: 'guest_mine', password: 'a long password', acceptTerms: true }, from(freshIp()))).json?.error === 'Account names cannot start with guest_.', 'sign-up cannot take a guest_ name');
++
++// Many guests: every hero gets its own name.
++const heroNames = new Set<string>([hero.name]);
++for (let i = 0; i < 12; i++) {
++  const g = await wake(freshIp());
++  if (g.status === 201) heroNames.add(g.json.character.name);
++}
++check(heroNames.size === 13, `thirteen guests, thirteen different hero names (${[...heroNames].slice(0, 6).join(', ')}, ...)`);
++
++// ---------- Limits: 3 an hour per address, stricter than sign-up ----------
++const ipL = freshIp();
++const byIp: number[] = [];
++for (let i = 0; i < 5; i++) byIp.push((await wake(ipL)).status);
++check(byIp.slice(0, 3).every((s) => s === 201) && byIp[3] === 429 && byIp[4] === 429, `one address makes 3 guests, then 429 (${byIp.join(',')})`);
++check((await wake(ipL)).json?.error === GUEST_LIMITED, 'with one plain line');
++check((await call('POST', '/api/register', { username: 'stilltheycan', password: 'a long password', acceptTerms: true }, from(ipL))).status === 201, 'the limited address can still make a named account');
++check((await wake(freshIp())).status === 201, 'another address is not limited');
++await advance(10 * 60_000);
++check((await wake(ipL)).status === 429, 'ten minutes later it is still limited (the window is an hour, not the five minutes of sign-up)');
++await advance(3600_000);
++check((await wake(ipL)).status === 201, 'after the hour it can wake again');
++
++// ---------- Closed for maintenance, and the CSRF check ----------
++site.setFlag('closed', '1');
++const closed = await wake(freshIp());
++check(closed.status === 503 && /maintenance/.test(closed.json?.error ?? ''), 'no guests while the realm is closed for maintenance');
++site.setFlag('closed', '0');
++check((await wake(freshIp(), true, { Origin: 'https://evil.example' })).status === 403, 'a Wake now from another site is refused');
++check((await wake(freshIp(), true, { 'Sec-Fetch-Site': 'cross-site' })).status === 403, 'and so is one the browser marks cross-site');
++check((await wake(freshIp(), true, { Origin: base })).status === 201, 'the game\'s own page may');
++
++await srv.stop();
++for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });
++console.log(failures ? `${failures} FAILED` : 'guest checks passed');
++await endProcess(failures ? 1 : 0);
+diff --git a/worker/auth.ts b/worker/auth.ts
+index aac2b27..ffdd15d 100644
+--- a/worker/auth.ts
++++ b/worker/auth.ts
+@@ -3,7 +3,11 @@
+ // Durable Object request gets 30 s. Keying the object by IP also gives the per-IP rate limit a
+ // single home, the same in-memory sliding window the Node server uses.
+ import { DurableObject } from 'cloudflare:workers';
+-import type { AccountInfo } from '../shared/protocol';
++import type { AccountInfo, CharacterSummary } from '../shared/protocol';
++import type { AccountRecord } from '../server/db';
++import { GUEST_FAILED, GUEST_LIMITED, GUEST_PER_HOUR, guestSecret, guestUsername } from '../shared/guest';
++import { allowPerHour } from '../server/site-rules';
++import { createGuestCharacter, summary } from '../server/characters';
+ import {
+   allowAttempt, BAD_LOGIN, loginShapeOk, newSessionToken, SESSION_MS, sha256Hex, USERNAME_RE, validateCredentials,
+ } from '../server/auth-rules';
+@@ -23,10 +27,15 @@ export type RecoveryOutcome =
+   | { ok: true; recoveryCode: string; accountId?: number }
+   | { ok: false; status: number; error: string };
+ 
++export type GuestOutcome =
++  | { ok: true; status: number; account: AccountInfo; token: string; character: CharacterSummary }
++  | { ok: false; status: number; error: string };
++
+ const PURGE_EVERY_MS = 3600_000;
+ 
+ export class AuthDO extends DurableObject<Env> {
+   private attempts = new Map<string, number[]>();
++  private guestHits = new Map<string, number[]>();
+   private dummy: Promise<string> | null = null;
+   private lastPurge = 0;
+ 
+@@ -61,6 +70,26 @@ export class AuthDO extends DurableObject<Env> {
+     return { ok: true, status: 200, account: { id: acc.id, username: acc.username }, token: await this.session(acc.id) };
+   }
+ 
++  /**
++   * Wake now (shared/guest.ts): a guest account with a secret password hashed as usual and told to nobody, its one ready
++   * hero and a session. This object is the one named for the client IP, so its hourly count is that address's share.
++   * The caller has checked the 16+ box and that logins are open.
++   */
++  async createGuest(terms: string): Promise<GuestOutcome> {
++    const max = Number(this.env.GUEST_RATE_LIMIT ?? GUEST_PER_HOUR) || GUEST_PER_HOUR;
++    if (!allowPerHour(this.guestHits, 'ip', max)) return { ok: false, status: 429, error: GUEST_LIMITED };
++    const db = repos(this.env.DB);
++    const hash = await pbkdf2Hash(guestSecret());
++    let acc: AccountRecord | null = null;
++    for (let i = 0; i < 3 && !acc; i++) acc = await db.accounts.create(guestUsername(), hash, terms, '', true);
++    if (!acc) return { ok: false, status: 503, error: GUEST_FAILED };
++    const id = acc.id;
++    // An exact duplicate name is left to the UNIQUE constraint (create answers null), one round trip fewer.
++    const rec = await createGuestCharacter(id, { nameTaken: () => false, lookalike: (key, name) => db.characters.lookalikeTaken(key, name), create: (c) => db.characters.create(c) });
++    if (!rec) { await db.accountData.delete(id); return { ok: false, status: 503, error: GUEST_FAILED }; }
++    return { ok: true, status: 201, account: { id, username: acc.username, guest: true }, token: await this.session(id), character: summary(rec) };
++  }
++
+   /** Asks for the password again before the account is deleted. Same per-IP limit as logins. */
+   async checkPassword(accountId: number, password: unknown): Promise<{ ok: boolean; status: number; error?: string }> {
+     const max = Number(this.env.AUTH_RATE_LIMIT ?? 10) || 10;
+diff --git a/worker/d1.ts b/worker/d1.ts
+index 1fa89a8..5ba8d6f 100644
+--- a/worker/d1.ts
++++ b/worker/d1.ts
+@@ -70,7 +70,7 @@ const isUnique = (err: unknown) => String(err).includes('UNIQUE');
+ function toAccount(r: Row): AccountRecord {
+   return {
+     id: Number(r.id), username: String(r.username), passHash: String(r.pass_hash), createdAt: Number(r.created_at),
+-    recoveryHash: String(r.recovery_hash ?? ''), recoveryAt: Number(r.recovery_at ?? 0),
++    recoveryHash: String(r.recovery_hash ?? ''), recoveryAt: Number(r.recovery_at ?? 0), guest: Number(r.guest ?? 0) === 1,
+   };
+ }
+ 
+@@ -85,12 +85,13 @@ export function adminSqlOf(db: D1Like): AdminSql {
+ 
+ export function repos(db: D1Like) {
+   const accounts = {
+-    async create(username: string, passHash: string, terms = '', recoveryHash = ''): Promise<AccountRecord | null> {
++    /** guest: a Wake now account (shared/guest.ts). */
++    async create(username: string, passHash: string, terms = '', recoveryHash = '', guest = false): Promise<AccountRecord | null> {
+       const now = Date.now();
+       const recoveryAt = recoveryHash ? now : 0;
+       try {
+-        const res = await db.prepare('INSERT INTO accounts (username, pass_hash, created_at, terms, recovery_hash, recovery_at) VALUES (?, ?, ?, ?, ?, ?)').bind(username, passHash, now, terms, recoveryHash, recoveryAt).run();
+-        return { id: Number(res.meta.last_row_id), username, passHash, createdAt: now, recoveryHash, recoveryAt };
++        const res = await db.prepare('INSERT INTO accounts (username, pass_hash, created_at, terms, recovery_hash, recovery_at, guest) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(username, passHash, now, terms, recoveryHash, recoveryAt, guest ? 1 : 0).run();
++        return { id: Number(res.meta.last_row_id), username, passHash, createdAt: now, recoveryHash, recoveryAt, guest };
+       } catch (err) {
+         if (isUnique(err)) return null;
+         throw err;
+@@ -130,15 +131,15 @@ export function repos(db: D1Like) {
+       await db.prepare('INSERT INTO sessions (token_hash, account_id, expires_at) VALUES (?, ?, ?)').bind(tokenHash, accountId, expiresAt).run();
+     },
+     /** The account for a live session, deleting it if expired. */
+-    async get(tokenHash: string): Promise<{ accountId: number; username: string } | null> {
+-      const r = await db.prepare('SELECT s.account_id, s.expires_at, a.username FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.token_hash = ?')
++    async get(tokenHash: string): Promise<{ accountId: number; username: string; guest: boolean } | null> {
++      const r = await db.prepare('SELECT s.account_id, s.expires_at, a.username, a.guest FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.token_hash = ?')
+         .bind(tokenHash).first<Row>();
+       if (!r) return null;
+       if (Number(r.expires_at) < Date.now()) {
+         await db.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(tokenHash).run();
+         return null;
+       }
+-      return { accountId: Number(r.account_id), username: String(r.username) };
++      return { accountId: Number(r.account_id), username: String(r.username), guest: Number(r.guest ?? 0) === 1 };
+     },
+     async delete(tokenHash: string): Promise<void> {
+       await db.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(tokenHash).run();
+@@ -360,7 +361,7 @@ export function repos(db: D1Like) {
+       const reps = await db.prepare('SELECT created_at, character_id, text, context FROM reports WHERE account_id = ? ORDER BY id').bind(accountId).all<Row>();
+       const terms = String((await db.prepare('SELECT terms FROM accounts WHERE id = ?').bind(accountId).first<Row>())?.terms ?? '');
+       return {
+-        account: { username: acc.username, createdAt: acc.createdAt, terms },
++        account: { username: acc.username, createdAt: acc.createdAt, terms, guest: acc.guest },
+         characters: chars.map(({ accountId: _a, ...c }) => c),
+         friends,
+         reports: reps.results.map((r) => {
+diff --git a/worker/env.ts b/worker/env.ts
+index b42e0ac..4edd7fb 100644
+--- a/worker/env.ts
++++ b/worker/env.ts
+@@ -14,6 +14,8 @@ export interface Env {
+   ALLOWED_ORIGINS?: string;
+   /** Login/register attempts per IP per 5 minutes (default 10). */
+   AUTH_RATE_LIMIT?: string;
++  /** Wake now guests per IP per hour (default 3, shared/guest.ts GUEST_PER_HOUR). */
++  GUEST_RATE_LIMIT?: string;
+   /** Recovery-code password resets per IP and per account name per 5 minutes (default 5). */
+   AUTH_RESET_RATE_LIMIT?: string;
+   /** Minutes without input before a player is logged out, to keep zones from running for nobody (0 = never; default 15). */
+diff --git a/worker/index.ts b/worker/index.ts
+index 83b84fb..43a228a 100644
+--- a/worker/index.ts
++++ b/worker/index.ts
+@@ -58,7 +58,7 @@ async function accountFrom(req: Request, env: Env): Promise<AccountInfo | null>
+   const token = tokenFromCookieHeader(req.headers.get('Cookie'));
+   if (!token) return null;
+   const s = await repos(env.DB).sessions.get(await sha256Hex(token));
+-  return s ? { id: s.accountId, username: s.username } : null;
++  return s ? { id: s.accountId, username: s.username, ...(s.guest ? { guest: true as const } : {}) } : null;
+ }
+ 
+ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+@@ -90,7 +90,18 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+     return json(202, { ok: true });
+   }
+ 
+-  if ((path === '/api/register' || path === '/api/login') && method === 'POST' && (await db.site.status()).closed) throw new HttpError(503, CLOSED_TEXT);
++  if ((path === '/api/register' || path === '/api/login' || path === '/api/guest') && method === 'POST' && (await db.site.status()).closed) throw new HttpError(503, CLOSED_TEXT);
++
++  // Wake now (shared/guest.ts): the 16+ box, then the AuthDO named for the address (3 guests an hour) makes the guest,
++  // its hero and a session.
++  if (path === '/api/guest' && method === 'POST') {
++    const b = await readJson(req);
++    if (!termsAccepted(b)) throw new HttpError(400, TERMS_REQUIRED);
++    const ip = req.headers.get('CF-Connecting-IP') ?? 'local';
++    const r = await env.AUTH.get(env.AUTH.idFromName(ip)).createGuest(termsAccepted(b));
++    if (!r.ok) throw new HttpError(r.status, r.error);
++    return json(201, { account: r.account, character: r.character }, { 'Set-Cookie': sessionCookieFor(r.token, secure) });
++  }
+ 
+   if ((path === '/api/register' || path === '/api/login') && method === 'POST') {
+     const b = await readJson(req);
+-- 
+2.53.0.windows.2
+

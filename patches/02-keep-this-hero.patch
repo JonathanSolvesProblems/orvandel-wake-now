@@ -1,0 +1,503 @@
+﻿From 3e706531cde42f7cff8b3d157a155e5061cd6371 Mon Sep 17 00:00:00 2001
+From: Jonathan Andrei <jon_andrei04@hotmail.com>
+Date: Tue, 20 Oct 2026 20:12:50 -0400
+Subject: [PATCH] Keep this hero: a guest names an account and keeps the
+ character
+
+---
+ client/src/guest-ribbon.ts   | 89 ++++++++++++++++++++++++++++++++++++
+ client/src/main.ts           |  6 ++-
+ client/src/net/api.ts        |  2 +
+ client/src/screens/select.ts | 15 +++++-
+ client/src/styles/launch.css | 22 +++++++++
+ server/api.ts                | 11 ++++-
+ server/auth.ts               | 20 +++++++-
+ server/db.ts                 | 13 ++++++
+ shared/protocol.ts           |  1 +
+ tests/cf-check.ts            | 21 +++++++++
+ tests/verify-guest.ts        | 31 +++++++++++++
+ worker/auth.ts               | 22 ++++++++-
+ worker/d1.ts                 | 10 ++++
+ worker/index.ts              |  8 ++++
+ 14 files changed, 265 insertions(+), 6 deletions(-)
+ create mode 100644 client/src/guest-ribbon.ts
+
+diff --git a/client/src/guest-ribbon.ts b/client/src/guest-ribbon.ts
+new file mode 100644
+index 0000000..9d34c5d
+--- /dev/null
++++ b/client/src/guest-ribbon.ts
+@@ -0,0 +1,89 @@
++// Keep this hero (shared/guest.ts): while the session is a guest, a small ribbon at the top of the world opens a short
++// window that names the account (sign-up's rules and messages). On success the one-time recovery code screen follows,
++// then the ribbon goes for good. The hero is not touched: the account only gains a name, a password and a code.
++import { api } from './net/api';
++import type { AccountInfo } from '../../shared/protocol';
++import { showRecoveryCode } from './screens/recovery';
++
++const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
++
++/**
++ * Opens the keep window over the page. `heroName` is said in the lede; `onKept` runs once the recovery code is saved.
++ * `onClose` runs when the window is closed without keeping.
++ */
++export function openKeepWindow(heroName: string, onKept: (acc: AccountInfo) => void, onClose?: () => void): void {
++  const veil = document.createElement('div');
++  veil.className = 'modal-veil guest-veil';
++  veil.innerHTML = `
++    <div class="modal stone guest-keep" role="dialog" aria-modal="true" aria-labelledby="keep-title">
++      <h2 id="keep-title" class="display">Keep this hero</h2>
++      <p class="guest-keep-lede">Name an account and set a password. ${heroName ? `<b>${esc(heroName)}</b> stays` : 'Your hero stays'} exactly as they are, here and now.</p>
++      <form novalidate>
++        <label class="tl-field"><span>Account name</span><input name="username" autocomplete="username" maxlength="20" spellcheck="false" /></label>
++        <label class="tl-field"><span>Password</span><input name="password" type="password" autocomplete="new-password" minlength="8" /></label>
++        <p class="tl-hint">3 to 20 letters, numbers or underscores. Passwords need at least 8 characters.</p>
++        <p class="form-error" role="alert" aria-live="assertive"></p>
++        <div class="modal-actions">
++          <button type="button" class="btn-ghost" data-close>Not now</button>
++          <button type="submit" class="btn-primary" data-keep>Keep this hero</button>
++        </div>
++      </form>
++    </div>`;
++  document.body.appendChild(veil);
++  const form = veil.querySelector('form')!;
++  const err = veil.querySelector<HTMLElement>('.form-error')!;
++  const go = veil.querySelector<HTMLButtonElement>('[data-keep]')!;
++  const field = (n: string) => veil.querySelector<HTMLInputElement>(`input[name=${n}]`)!;
++  const close = () => { veil.remove(); onClose?.(); };
++  veil.querySelector('[data-close]')!.addEventListener('click', close);
++  // Keys typed here belong to the form, not to the game's bindings underneath; Escape closes the window.
++  veil.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Escape' && !veil.querySelector('.rc-veil')) close(); });
++  veil.addEventListener('keyup', (e) => e.stopPropagation());
++  form.addEventListener('submit', async (e) => {
++    e.preventDefault();
++    const username = field('username').value.trim();
++    const password = field('password').value;
++    if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) { err.textContent = 'Account names are 3 to 20 letters, numbers or underscores.'; return; }
++    if (password.length < 8) { err.textContent = 'Passwords need at least 8 characters.'; return; }
++    err.textContent = '';
++    go.disabled = true;
++    go.classList.add('busy');
++    try {
++      const res = await api.keep(username, password);
++      field('password').value = '';
++      veil.querySelector<HTMLElement>('.guest-keep')!.hidden = true;
++      veil.classList.add('guest-veil-clear'); // the recovery screen brings its own shade
++      showRecoveryCode(veil, res.recoveryCode, {
++        username: res.account.username,
++        heading: 'Your hero is kept',
++        lede: `The account ${res.account.username} is yours now. There is no email on an account here, so this recovery code is the only way back in if you forget your password. It is shown once. Save it now.`,
++        doneLabel: 'Back to the world',
++        onDone: () => { veil.remove(); onKept(res.account); },
++      });
++    } catch (ex: any) {
++      err.textContent = ex?.message ?? 'Something went wrong.';
++    } finally {
++      go.disabled = false;
++      go.classList.remove('busy');
++    }
++  });
++  window.setTimeout(() => field('username').focus(), 0);
++}
++
++/** The ribbon at the top of the world while the session is a guest. Returns a remover. */
++export function mountGuestRibbon(parent: HTMLElement, heroName: string, onKept: (acc: AccountInfo) => void): () => void {
++  const el = document.createElement('div');
++  el.className = 'guest-ribbon';
++  el.setAttribute('role', 'region');
++  el.setAttribute('aria-label', 'Guest');
++  el.innerHTML = `<span class="guest-ribbon-text">Playing as a guest</span><button type="button" class="guest-ribbon-keep">Keep this hero</button>`;
++  parent.appendChild(el);
++  const btn = el.querySelector<HTMLButtonElement>('button')!;
++  // Pointer presses here are the ribbon's, not a camera drag in the world underneath.
++  el.addEventListener('pointerdown', (e) => e.stopPropagation());
++  btn.addEventListener('click', () => {
++    btn.blur();
++    openKeepWindow(heroName, (acc) => { el.remove(); onKept(acc); });
++  });
++  return () => el.remove();
++}
+diff --git a/client/src/main.ts b/client/src/main.ts
+index 72d1b79..59cd23d 100644
+--- a/client/src/main.ts
++++ b/client/src/main.ts
+@@ -7,6 +7,7 @@ import { api } from './net/api';
+ import type { AccountInfo, CharacterSummary } from '../../shared/protocol';
+ import { ZONES } from '../../shared/zones';
+ import { WAKING_LINE } from '../../shared/guest';
++import { mountGuestRibbon } from './guest-ribbon';
+ import { mountLogin } from './screens/login';
+ import { mountSelect } from './screens/select';
+ import { mountCreator } from './screens/creator';
+@@ -122,7 +123,10 @@ async function enterWorld(c: CharacterSummary, waking = false) {
+       const holder = document.createElement('div');
+       holder.className = 'game-root';
+       app.appendChild(holder);
+-      return startGame(holder, c, { onExit: () => void showSelect(c.id), waking });
++      const game = startGame(holder, c, { onExit: () => void showSelect(c.id), waking });
++      // A guest sees the Keep this hero ribbon until the account is named.
++      if (account?.guest) mountGuestRibbon(holder, c.name, (acc) => { account = acc; });
++      return game;
+     });
+   } catch (err) {
+     console.error(err);
+diff --git a/client/src/net/api.ts b/client/src/net/api.ts
+index 5e8afc8..a146c4c 100644
+--- a/client/src/net/api.ts
++++ b/client/src/net/api.ts
+@@ -38,6 +38,8 @@ export const api = {
+   register: (username: string, password: string, acceptTerms = false) => call<{ account: AccountInfo; recoveryCode?: string }>('POST', '/register', { username, password, acceptTerms }),
+   /** Wake now: a guest account with one ready hero, signed in at once. acceptTerms: the 16+ and terms box was ticked. */
+   guest: (acceptTerms: boolean) => call<{ account: AccountInfo; character: CharacterSummary }>('POST', '/guest', { acceptTerms }),
++  /** Keep this hero: a guest names the account (sign-up's rules). The recovery code comes back once. */
++  keep: (username: string, password: string) => call<{ account: AccountInfo; recoveryCode: string }>('POST', '/account/keep', { username, password }),
+   /** Sets a new password (the current one is asked again) and ends every other session of the account. */
+   changePassword: (current: string, password: string) => call<{ ok: true }>('POST', '/account/password', { current, password }),
+   /** Makes a new recovery code (the password is asked again). The old code stops working; the new one is shown once. */
+diff --git a/client/src/screens/select.ts b/client/src/screens/select.ts
+index 1e513a0..ff4f7c7 100644
+--- a/client/src/screens/select.ts
++++ b/client/src/screens/select.ts
+@@ -10,6 +10,7 @@ import type { Screen } from '../main';
+ import { music } from '../game/audio/music';
+ import { mark } from '../perf-marks';
+ import { openAccountDialog } from './account';
++import { openKeepWindow } from '../guest-ribbon';
+ 
+ interface Opts {
+   account: AccountInfo;
+@@ -81,7 +82,7 @@ export function mountSelect(app: HTMLElement, opts: Opts): Screen {
+       <nav class="topnav">
+         <a href="/wiki.html" target="_blank" rel="noopener">World wiki</a>
+         <span class="who">${opts.account.guest ? 'Guest' : esc(opts.account.username)}</span>
+-        <button type="button" class="link-btn" data-account>Account</button>
++        <button type="button" class="link-btn" data-account>${opts.account.guest ? 'Keep this hero' : 'Account'}</button>
+         <button type="button" class="link-btn" data-logout>Log out</button>
+       </nav>
+     </header>
+@@ -331,7 +332,17 @@ export function mountSelect(app: HTMLElement, opts: Opts): Screen {
+   el.querySelector('[data-create]')!.addEventListener('click', () => opts.onCreate());
+   el.querySelector('[data-proving]')?.addEventListener('click', () => opts.onProving?.());
+   el.querySelector('[data-logout]')!.addEventListener('click', () => opts.onLogout());
+-  el.querySelector('[data-account]')!.addEventListener('click', () => openAccountDialog(el, opts.account.username, () => opts.onLogout()));
++  el.querySelector('[data-account]')!.addEventListener('click', (e) => {
++    // A guest (shared/guest.ts) has no account to manage yet: the link names it instead, keeping every hero on it.
++    if (!opts.account.guest) return openAccountDialog(el, opts.account.username, () => opts.onLogout());
++    const link = e.currentTarget as HTMLElement;
++    openKeepWindow(sel.name, (acc) => {
++      delete opts.account.guest;
++      opts.account.username = acc.username;
++      el.querySelector('.who')!.textContent = acc.username;
++      link.textContent = 'Account';
++    });
++  });
+   el.querySelector('[data-delete]')!.addEventListener('click', () => confirmDelete(sel));
+ 
+   function confirmDelete(c: CharacterSummary) {
+diff --git a/client/src/styles/launch.css b/client/src/styles/launch.css
+index d07409b..ac62c78 100644
+--- a/client/src/styles/launch.css
++++ b/client/src/styles/launch.css
+@@ -79,6 +79,28 @@
+ .tl-phone p { margin: 6px 0 0; }
+ .tl-phone a { color: var(--gold, #d9b66b); }
+ 
++/* Keep this hero (client/src/guest-ribbon.ts): the site-notice's look, small and top centre, clear of the HUD's corners. */
++.guest-ribbon {
++  position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 8990;
++  display: flex; align-items: center; gap: 12px; padding: 5px 6px 5px 14px;
++  background: rgba(40, 26, 10, 0.88); border: 1px solid rgba(217, 182, 107, 0.6); border-radius: 6px;
++  color: var(--gold-hi, #f6e1a8); font-size: var(--t-sm, 14px); line-height: 1.3; white-space: nowrap;
++  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55); animation: guest-rise 0.9s var(--ease-out, ease-out) 0.6s both;
++}
++@keyframes guest-rise { from { opacity: 0; transform: translate(-50%, -8px); } to { opacity: 1; transform: translate(-50%, 0); } }
++.guest-ribbon-text { color: rgba(236, 228, 207, 0.9); }
++.guest-ribbon-keep {
++  padding: 4px 12px; border-radius: 4px; cursor: pointer;
++  border: 1px solid rgba(217, 182, 107, 0.6); background: linear-gradient(180deg, rgba(217, 182, 107, 0.22), rgba(217, 182, 107, 0.08));
++  color: var(--gold-hi, #f6e1a8); font-family: var(--font-display, serif); font-weight: 700; font-size: var(--t-sm, 14px); letter-spacing: 0.06em;
++  transition: border-color 0.2s, background 0.2s;
++}
++.guest-ribbon-keep:hover, .guest-ribbon-keep:focus-visible { border-color: var(--gold, #d9b66b); background: rgba(217, 182, 107, 0.3); outline: none; }
++.guest-veil { position: fixed; z-index: 9100; }
++.guest-veil-clear { background: transparent; }
++.guest-keep .guest-keep-lede { margin: 0 0 14px; color: rgba(236, 228, 207, 0.9); line-height: 1.45; }
++.guest-keep .form-error { margin: 0 0 8px; }
++
+ .acct-modal { max-width: min(520px, calc(100vw - 32px)); }
+ .acct-modal .acct-who { margin-top: 0; color: var(--moon-2, #cfc6b0); }
+ .acct-block { margin: 14px 0; padding-top: 10px; border-top: 1px solid rgba(217, 182, 107, 0.22); }
+diff --git a/server/api.ts b/server/api.ts
+index 02a7595..f85c835 100644
+--- a/server/api.ts
++++ b/server/api.ts
+@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
+ import {
+   accountFromRequest, allowAuthAttempt, allowResetAttempt, changePassword, checkAccountPassword, clearCookie, clientIp, destroySession, login,
+   allowAdminAttempt, allowRedeemAttempt, makeRecoveryCode, recoveryState, register, resetPassword, sessionCookie, sessionToken,
+-  allowGuestAttempt, createGuest,
++  allowGuestAttempt, createGuest, keepGuest,
+ } from './auth';
+ import { GUEST_LIMITED } from '../shared/guest';
+ import { RESET_LIMITED } from './recovery-rules';
+@@ -334,6 +334,15 @@ async function route(req: IncomingMessage, res: ServerResponse, world: World): P
+     if (!r.ok) throw new HttpError(r.status, r.error);
+     return sendJson(res, 200, { recoveryCode: r.recoveryCode });
+   }
++  // Keep this hero (shared/guest.ts): a guest session names the account. Sign-up's rules and messages, the login limit.
++  if (path === '/api/account/keep' && method === 'POST') {
++    if (!account) throw new HttpError(401, 'Not logged in.');
++    if (!allowAuthAttempt(clientIp(req))) throw new HttpError(429, 'Too many attempts. Try again in a few minutes.');
++    const b = await readJson(req);
++    const r = await keepGuest(account.id, b.username, b.password);
++    if (!r.ok) throw new HttpError(r.status, r.error);
++    return sendJson(res, 200, { account: r.account, recoveryCode: r.recoveryCode });
++  }
+   // Complimentary access code (server/comp-rules.ts): COMP_CODES in the environment, read each time. Unset: every code is refused.
+   if (path === '/api/account/redeem' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
+diff --git a/server/auth.ts b/server/auth.ts
+index eabc9ff..baccc8f 100644
+--- a/server/auth.ts
++++ b/server/auth.ts
+@@ -14,7 +14,7 @@ import {
+ } from './recovery-rules';
+ import { ADMIN_RATE_DEFAULT } from './admin-rules';
+ import { allowPerHour } from './site-rules';
+-import { GUEST_FAILED, GUEST_PER_HOUR, guestSecret, guestUsername } from '../shared/guest';
++import { GUEST_FAILED, GUEST_PER_HOUR, guestSecret, guestUsername, NOT_A_GUEST } from '../shared/guest';
+ import { createGuestCharacter } from './characters';
+ 
+ export { COOKIE_NAME };
+@@ -155,6 +155,24 @@ export async function createGuest(terms: string): Promise<GuestResult> {
+   return { ok: true, account: info(acc), token: createSession(id), character };
+ }
+ 
++/**
++ * Keep this hero: the guest names the account. The same rules and messages as sign-up; on success the account has the
++ * name, the password and a recovery code (returned once), the guest mark is gone, and the session and the hero are unchanged.
++ */
++export async function keepGuest(accountId: number, username: unknown, password: unknown): Promise<{ ok: true; account: AccountInfo; recoveryCode: string } | { ok: false; status: number; error: string }> {
++  const acc = accounts.byId(accountId);
++  if (!acc?.guest) return { ok: false, status: 409, error: NOT_A_GUEST };
++  const err = validateCredentials(username, password);
++  if (err) return { ok: false, status: 400, error: err };
++  const u = username as string;
++  if (accounts.byName(u)) return { ok: false, status: 409, error: 'That username is taken.' };
++  const recoveryCode = newRecoveryCode();
++  const r = accounts.keep(accountId, u, await hashPassword(password as string), await hashPassword(normalizeRecoveryCode(recoveryCode)!));
++  if (r === 'taken') return { ok: false, status: 409, error: 'That username is taken.' };
++  if (r === 'gone') return { ok: false, status: 409, error: NOT_A_GUEST };
++  return { ok: true, account: { id: accountId, username: u }, recoveryCode };
++}
++
+ export async function login(username: unknown, password: unknown): Promise<AuthResult> {
+   if (!loginShapeOk(username, password)) return { ok: false, status: 401, error: BAD_LOGIN };
+   const acc = USERNAME_RE.test(username) ? accounts.byName(username) : null;
+diff --git a/server/db.ts b/server/db.ts
+index bf15483..47fe0af 100644
+--- a/server/db.ts
++++ b/server/db.ts
+@@ -447,6 +447,19 @@ export const accounts = {
+     const r = stmts.accountById.get(id) as Row | undefined;
+     return r ? toAccount(r) : null;
+   },
++  /**
++   * Keep this hero (shared/guest.ts): a guest account takes a name, a password and a recovery code, and loses the guest
++   * mark. 'taken' when another account has the name, 'gone' when the account is no longer a guest (kept already, or swept).
++   */
++  keep(id: number, username: string, passHash: string, recoveryHash: string, now = Date.now()): 'ok' | 'taken' | 'gone' {
++    try {
++      const r = db.prepare('UPDATE accounts SET username = ?, pass_hash = ?, recovery_hash = ?, recovery_at = ?, guest = 0 WHERE id = ? AND guest = 1').run(username, passHash, recoveryHash, now, id);
++      return Number(r.changes) === 1 ? 'ok' : 'gone';
++    } catch (err) {
++      if (String(err).includes('UNIQUE')) return 'taken';
++      throw err;
++    }
++  },
+   /** Stores a new recovery code hash, replacing the old one (which stops working). */
+   setRecovery(id: number, hash: string, now = Date.now()): void {
+     db.prepare('UPDATE accounts SET recovery_hash = ?, recovery_at = ? WHERE id = ?').run(hash, now, id);
+diff --git a/shared/protocol.ts b/shared/protocol.ts
+index cfc245e..96f6a83 100644
+--- a/shared/protocol.ts
++++ b/shared/protocol.ts
+@@ -21,6 +21,7 @@ export type QueueState = 'idle' | 'queued' | 'proposed' | 'entering';
+ // POST /api/register   { username, password }            -> { account, recoveryCode }  (the code is shown once; only its hash is stored)
+ // POST /api/login      { username, password }            -> { account }
+ // POST /api/guest      { acceptTerms }                   -> { account (guest: true), character }  (Wake now; 3 per address per hour)
++// POST /api/account/keep { username, password }          -> { account, recoveryCode }  (a guest names the account and keeps the hero)
+ // POST /api/logout                                       -> { ok }
+ // GET  /api/me                                           -> { account, membership, recovery: { exists, createdAt } } | 401
+ // POST /api/account/password { current, password }       -> { ok }  (ends every other session)
+diff --git a/tests/cf-check.ts b/tests/cf-check.ts
+index bccc768..3c4041f 100644
+--- a/tests/cf-check.ts
++++ b/tests/cf-check.ts
+@@ -106,6 +106,22 @@ async function recoverySequence(a: AccountsLike, s: SessionsLike, username: stri
+   return JSON.stringify(out);
+ }
+ 
++// Wake now guests (shared/guest.ts; server/auth.ts and worker/auth.ts go through these): marked at creation, the mark on the
++// session, and Keep this hero refusing a taken name, then naming the account once.
++type GuestAccountsLike = { create(u: string, p: string, t?: string, r?: string, g?: boolean): any; byId(id: number): any; keep(id: number, u: string, p: string, r: string, now?: number): any };
++async function guestSequence(a: GuestAccountsLike, s: SessionsLike): Promise<string> {
++  const out: unknown[] = [];
++  const view = (r: any) => r && { username: r.username, guest: r.guest, passHash: r.passHash, recoveryHash: r.recoveryHash, recoveryAt: r.recoveryAt };
++  const g = await a.create('guest_seqtest001', 'secret', '2026-10-01', '', true);
++  await a.create('Taken_One', 'pw');
++  await s.create('gs1', g.id, Date.now() + 60_000);
++  out.push(view(g), (await s.get('gs1'))?.guest);
++  out.push(await a.keep(g.id, 'taken_one', 'pw2', 'rc2', 9000), view(await a.byId(g.id)));
++  out.push(await a.keep(g.id, 'Kept_One', 'pw3', 'rc3', 9000), view(await a.byId(g.id)), await s.get('gs1'));
++  out.push(await a.keep(g.id, 'Kept_Two', 'pw4', 'rc4', 9100), view(await a.byId(g.id)));
++  return JSON.stringify(out);
++}
++
+ // ---------- Node side: migrate a fresh file and store one character ----------
+ openDatabase(DB);
+ const body = { name: 'Parity', faction: 'concord', race: 'human', cls: 'vanguard', appearance: defaultAppearance('human') };
+@@ -128,6 +144,7 @@ const nodeRec = characters.get(nodeNew.id)!;
+ const nodeDisc = await discoverySequence(discovery);
+ const nodeBilling = await billingSequence(billing, nodeAcc.id);
+ const nodeRecovery = await recoverySequence(accounts, sessions, 'rec_user');
++const nodeGuest = await guestSequence(accounts, sessions);
+ closeDatabase();
+ 
+ // ---------- D1 side: apply migrations/*.sql to an empty database ----------
+@@ -247,6 +264,10 @@ await d1.sessions.create('h1', acc.id, Date.now() + 60_000);
+ await d1.sessions.create('h2', acc.id, Date.now() - 1);
+ if ((await d1.sessions.get('h1'))?.username !== 'Parity_User') fail('D1 session lookup');
+ if (await d1.sessions.get('h2')) fail('D1 returned an expired session');
++const d1Guest = await guestSequence(d1.accounts, d1.sessions);
++if (d1Guest !== nodeGuest) fail(`guests differ:\n  node ${nodeGuest}\n  d1   ${d1Guest}`);
++else if (!/^\[\{"username":"guest_seqtest001","guest":true.*,true,"taken",.*"ok",\{"username":"Kept_One","guest":false,"passHash":"pw3","recoveryHash":"rc3","recoveryAt":9000\},.*"gone"/.test(d1Guest)) fail(`unexpected guest answers: ${d1Guest}`);
++else log('guests and Keep this hero: the same answers from node:sqlite and D1 (marked, marked on the session, a taken name refused, kept once with the name, password and code, then refused)');
+ // Wake now (shared/guest.ts): the guest mark is stored, read back on the account and on its session; a normal account has none.
+ {
+   const g = (await d1.accounts.create('guest_paritycheck', 'x', '2026-10-01', '', true))!;
+diff --git a/tests/verify-guest.ts b/tests/verify-guest.ts
+index cbab772..e2758ba 100644
+--- a/tests/verify-guest.ts
++++ b/tests/verify-guest.ts
+@@ -90,6 +90,37 @@ for (let i = 0; i < 12; i++) {
+ }
+ check(heroNames.size === 13, `thirteen guests, thirteen different hero names (${[...heroNames].slice(0, 6).join(', ')}, ...)`);
+ 
++// ---------- Keep this hero: the guest names the account ----------
++const ipK = freshIp();
++const k = await wake(ipK);
++const kc = k.cookie;
++const kHero = k.json.character;
++const keep = (body: Record<string, unknown>, cookie = kc, extra: Record<string, string> = {}) => call('POST', '/api/account/keep', body, { ...from(ipK, cookie), ...extra });
++const signUpTaken = await call('POST', '/api/register', { username: 'wakerofnone', password: 'a long password', acceptTerms: true }, from(freshIp()));
++const keptTaken = await keep({ username: 'WakerOfNone', password: 'a long password' });
++check(keptTaken.status === 409 && keptTaken.json?.error === signUpTaken.json?.error, `a taken name gets sign-up's own message (${keptTaken.json?.error})`);
++const signUpWeak = await call('POST', '/api/register', { username: 'weakling', password: 'short', acceptTerms: true }, from(freshIp()));
++const keptWeak = await keep({ username: 'brandnewname', password: 'short' });
++check(keptWeak.status === 400 && keptWeak.json?.error === signUpWeak.json?.error, `a weak password gets sign-up's own message (${keptWeak.json?.error})`);
++check((await keep({ username: 'bad name!', password: 'a long password' })).status === 400 && (await keep({ username: 'guest_again', password: 'a long password' })).status === 400, 'a malformed name or a guest_ name is refused');
++check(accounts.byId(k.json.account.id)?.guest === true && accounts.byId(k.json.account.id)?.username === k.json.account.username, 'after each refusal nothing changed: still the same guest');
++check((await keep({ username: 'brandnewname', password: 'a long password' }, '')).status === 401, 'keeping needs a session');
++check((await keep({ username: 'brandnewname', password: 'a long password' }, named.cookie)).json?.error === 'This account already has a name.', 'a named account cannot keep');
++check((await keep({ username: 'brandnewname', password: 'a long password' }, kc, { Origin: 'https://evil.example' })).status === 403, 'a keep from another site is refused');
++const kept = await keep({ username: 'Brandnewname', password: 'a kept password' });
++check(kept.status === 200 && kept.json?.account?.username === 'Brandnewname' && !('guest' in kept.json.account) && /^[0-9A-Z]{5}(-[0-9A-Z]{5}){3}$/.test(kept.json?.recoveryCode ?? ''), 'keeping answers with the named account and a recovery code, shown once');
++check(!/a kept password|scrypt/.test(kept.text), 'the answer carries no password or hash');
++const keptRec = accounts.byName('brandnewname')!;
++check(keptRec.id === k.json.account.id && keptRec.guest === false && keptRec.recoveryHash.startsWith('scrypt$') && keptRec.recoveryAt > 0, 'stored: the same account, no guest mark, a hashed recovery code');
++const keptSes = await call('GET', '/api/session', undefined, from(ipK, kc));
++check(keptSes.json?.account?.username === 'Brandnewname' && !('guest' in keptSes.json.account), 'the same session goes on as the named account');
++const keptList = await call('GET', '/api/characters', undefined, from(ipK, kc));
++const same = keptList.json?.characters?.[0];
++check(keptList.json?.characters?.length === 1 && same.id === kHero.id && same.name === kHero.name && same.level === kHero.level && JSON.stringify(same.appearance) === JSON.stringify(kHero.appearance), 'the hero is unchanged');
++check((await call('POST', '/api/login', { username: 'brandnewname', password: 'a kept password' }, from(freshIp()))).status === 200, 'logging in with the new name and password works');
++check((await keep({ username: 'othername', password: 'a long password' })).json?.error === 'This account already has a name.', 'keeping twice is refused');
++check((await call('GET', '/api/me', undefined, from(ipK, kc))).json?.recovery?.exists === true, 'the account window sees a recovery code');
++
+ // ---------- Limits: 3 an hour per address, stricter than sign-up ----------
+ const ipL = freshIp();
+ const byIp: number[] = [];
+diff --git a/worker/auth.ts b/worker/auth.ts
+index ffdd15d..31681f1 100644
+--- a/worker/auth.ts
++++ b/worker/auth.ts
+@@ -5,7 +5,7 @@
+ import { DurableObject } from 'cloudflare:workers';
+ import type { AccountInfo, CharacterSummary } from '../shared/protocol';
+ import type { AccountRecord } from '../server/db';
+-import { GUEST_FAILED, GUEST_LIMITED, GUEST_PER_HOUR, guestSecret, guestUsername } from '../shared/guest';
++import { GUEST_FAILED, GUEST_LIMITED, GUEST_PER_HOUR, guestSecret, guestUsername, NOT_A_GUEST } from '../shared/guest';
+ import { allowPerHour } from '../server/site-rules';
+ import { createGuestCharacter, summary } from '../server/characters';
+ import {
+@@ -90,6 +90,26 @@ export class AuthDO extends DurableObject<Env> {
+     return { ok: true, status: 201, account: { id, username: acc.username, guest: true }, token: await this.session(id), character: summary(rec) };
+   }
+ 
++  /**
++   * Keep this hero: the guest names the account, with sign-up's rules and messages and the login limit. On success the
++   * account has the name, the password and a recovery code (returned once) and the guest mark is gone; the session stays.
++   */
++  async keepGuest(accountId: number, username: unknown, password: unknown): Promise<{ ok: true; account: AccountInfo; recoveryCode: string } | { ok: false; status: number; error: string }> {
++    const max = Number(this.env.AUTH_RATE_LIMIT ?? 10) || 10;
++    if (!allowAttempt(this.attempts, 'ip', max)) return { ok: false, status: 429, error: 'Too many attempts. Try again in a few minutes.' };
++    const db = repos(this.env.DB);
++    if (!(await db.accounts.byId(accountId))?.guest) return { ok: false, status: 409, error: NOT_A_GUEST };
++    const err = validateCredentials(username, password);
++    if (err) return { ok: false, status: 400, error: err };
++    const u = username as string;
++    if (await db.accounts.byName(u)) return { ok: false, status: 409, error: 'That username is taken.' };
++    const recoveryCode = newRecoveryCode();
++    const r = await db.accounts.keep(accountId, u, await pbkdf2Hash(password as string), await pbkdf2Hash(normalizeRecoveryCode(recoveryCode)!));
++    if (r === 'taken') return { ok: false, status: 409, error: 'That username is taken.' };
++    if (r === 'gone') return { ok: false, status: 409, error: NOT_A_GUEST };
++    return { ok: true, account: { id: accountId, username: u }, recoveryCode };
++  }
++
+   /** Asks for the password again before the account is deleted. Same per-IP limit as logins. */
+   async checkPassword(accountId: number, password: unknown): Promise<{ ok: boolean; status: number; error?: string }> {
+     const max = Number(this.env.AUTH_RATE_LIMIT ?? 10) || 10;
+diff --git a/worker/d1.ts b/worker/d1.ts
+index 5ba8d6f..3524423 100644
+--- a/worker/d1.ts
++++ b/worker/d1.ts
+@@ -105,6 +105,16 @@ export function repos(db: D1Like) {
+       const r = await db.prepare('SELECT * FROM accounts WHERE id = ?').bind(id).first<Row>();
+       return r ? toAccount(r) : null;
+     },
++    /** Keep this hero: the guest takes a name, a password and a recovery code and loses the mark (server/db.ts accounts.keep). */
++    async keep(id: number, username: string, passHash: string, recoveryHash: string, now = Date.now()): Promise<'ok' | 'taken' | 'gone'> {
++      try {
++        const r = await db.prepare('UPDATE accounts SET username = ?, pass_hash = ?, recovery_hash = ?, recovery_at = ?, guest = 0 WHERE id = ? AND guest = 1').bind(username, passHash, recoveryHash, now, id).run();
++        return Number(r.meta.changes) === 1 ? 'ok' : 'gone';
++      } catch (err) {
++        if (isUnique(err)) return 'taken';
++        throw err;
++      }
++    },
+     /** Stores a new recovery code hash, replacing the old one (which stops working). */
+     async setRecovery(id: number, hash: string, now = Date.now()): Promise<void> {
+       await db.prepare('UPDATE accounts SET recovery_hash = ?, recovery_at = ? WHERE id = ?').bind(hash, now, id).run();
+diff --git a/worker/index.ts b/worker/index.ts
+index 43a228a..6578794 100644
+--- a/worker/index.ts
++++ b/worker/index.ts
+@@ -240,6 +240,14 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+     if (!r.ok) throw new HttpError(r.status, r.error);
+     return json(200, { recoveryCode: r.recoveryCode });
+   }
++  // Keep this hero (shared/guest.ts): a guest session names the account, in the AuthDO named for the address (the login limit).
++  if (path === '/api/account/keep' && method === 'POST') {
++    if (!account) throw new HttpError(401, 'Not logged in.');
++    const b = await readJson(req);
++    const r = await env.AUTH.get(env.AUTH.idFromName(req.headers.get('CF-Connecting-IP') ?? 'local')).keepGuest(account.id, b.username, b.password);
++    if (!r.ok) throw new HttpError(r.status, r.error);
++    return json(200, { account: r.account, recoveryCode: r.recoveryCode });
++  }
+   // Complimentary access code (server/comp-rules.ts): the COMP_CODES secret. Limited per IP and per account (AuthDO slots).
+   if (path === '/api/account/redeem' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
+-- 
+2.53.0.windows.2
+

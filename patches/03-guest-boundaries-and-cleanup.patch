@@ -1,0 +1,851 @@
+﻿From 3ca77780211ac8ce05ec7eadab2c0db09d20c5e7 Mon Sep 17 00:00:00 2001
+From: Jonathan Andrei <jon_andrei04@hotmail.com>
+Date: Tue, 20 Oct 2026 20:39:09 -0400
+Subject: [PATCH] Guest boundaries, logout warning, hourly cleanup and admin
+ count
+
+---
+ client/src/screens/select.ts |  52 +++++++++++++++-
+ server/admin-page.ts         |   2 +-
+ server/admin-rules.ts        |  11 ++--
+ server/api.ts                |   7 ++-
+ server/app.ts                |   6 +-
+ server/auth.ts               |  27 +++++++-
+ server/db.ts                 |   6 +-
+ server/site-rules.ts         |   8 +++
+ server/world/entities.ts     |   2 +
+ server/world/world.ts        |  24 ++++++--
+ tests/cf-check.ts            |  10 ++-
+ tests/cf-local.ts            |  58 ++++++++++++++++++
+ tests/verify-guest.ts        | 115 ++++++++++++++++++++++++++++++++---
+ worker/d1.ts                 |   7 ++-
+ worker/index.ts              |  29 +++++++++
+ worker/zone.ts               |   5 ++
+ wrangler.toml                |   5 ++
+ 17 files changed, 345 insertions(+), 29 deletions(-)
+
+diff --git a/client/src/screens/select.ts b/client/src/screens/select.ts
+index ff4f7c7..eac3716 100644
+--- a/client/src/screens/select.ts
++++ b/client/src/screens/select.ts
+@@ -11,6 +11,7 @@ import { music } from '../game/audio/music';
+ import { mark } from '../perf-marks';
+ import { openAccountDialog } from './account';
+ import { openKeepWindow } from '../guest-ribbon';
++import { GUEST_REFUSED } from '../../../shared/guest';
+ 
+ interface Opts {
+   account: AccountInfo;
+@@ -329,9 +330,54 @@ export function mountSelect(app: HTMLElement, opts: Opts): Screen {
+   window.addEventListener('keydown', onKey);
+ 
+   el.querySelector('[data-enter]')!.addEventListener('click', () => opts.onEnter(sel));
+-  el.querySelector('[data-create]')!.addEventListener('click', () => opts.onCreate());
+-  el.querySelector('[data-proving]')?.addEventListener('click', () => opts.onProving?.());
+-  el.querySelector('[data-logout]')!.addEventListener('click', () => opts.onLogout());
++  // A guest keeps one hero: more characters and the Proving Grounds wait until the hero is kept (shared/guest.ts).
++  el.querySelector('[data-create]')!.addEventListener('click', () => (opts.account.guest ? guestDoor() : opts.onCreate()));
++  el.querySelector('[data-proving]')?.addEventListener('click', () => (opts.account.guest ? guestDoor() : opts.onProving?.()));
++  el.querySelector('[data-logout]')!.addEventListener('click', () => (opts.account.guest ? confirmGuestLogout() : opts.onLogout()));
++
++  /** The one calm line a guest meets at a door kept for named accounts, with the way to keep the hero. */
++  function guestDoor() {
++    const m = document.createElement('div');
++    m.className = 'modal-veil';
++    m.innerHTML = `
++      <div class="modal stone" role="dialog" aria-modal="true" aria-labelledby="gd-title">
++        <h2 id="gd-title" class="display">Not yet</h2>
++        <p>${esc(GUEST_REFUSED)}</p>
++        <div class="modal-actions">
++          <button type="button" class="btn-ghost" data-close>Not now</button>
++          <button type="button" class="btn-primary" data-keep>Keep this hero</button>
++        </div>
++      </div>`;
++    el.appendChild(m);
++    const close = () => m.remove();
++    m.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
++    m.addEventListener('click', (e) => { if (e.target === m) close(); });
++    m.querySelector('[data-close]')!.addEventListener('click', close);
++    m.querySelector('[data-keep]')!.addEventListener('click', () => { close(); el.querySelector<HTMLElement>('[data-account]')!.click(); });
++    window.setTimeout(() => m.querySelector<HTMLElement>('[data-keep]')?.focus(), 0);
++  }
++
++  /** Logging out ends a guest's session for good (it has no password to sign back in with): ask first, offering to keep the hero. */
++  function confirmGuestLogout() {
++    const m = document.createElement('div');
++    m.className = 'modal-veil';
++    m.innerHTML = `
++      <div class="modal stone" role="dialog" aria-modal="true" aria-labelledby="gl-title">
++        <h2 id="gl-title" class="display">Leave as a guest?</h2>
++        <p>A guest has no password, so logging out ends it for good. ${esc(sel.name)} will be lost unless you keep the hero first.</p>
++        <div class="modal-actions">
++          <button type="button" class="btn-ghost" data-anyway>Log out anyway</button>
++          <button type="button" class="btn-primary" data-keep>Keep this hero</button>
++        </div>
++      </div>`;
++    el.appendChild(m);
++    const close = () => m.remove();
++    m.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
++    m.addEventListener('click', (e) => { if (e.target === m) close(); });
++    m.querySelector('[data-anyway]')!.addEventListener('click', () => { close(); opts.onLogout(); });
++    m.querySelector('[data-keep]')!.addEventListener('click', () => { close(); el.querySelector<HTMLElement>('[data-account]')!.click(); });
++    window.setTimeout(() => m.querySelector<HTMLElement>('[data-keep]')?.focus(), 0);
++  }
+   el.querySelector('[data-account]')!.addEventListener('click', (e) => {
+     // A guest (shared/guest.ts) has no account to manage yet: the link names it instead, keeping every hero on it.
+     if (!opts.account.guest) return openAccountDialog(el, opts.account.username, () => opts.onLogout());
+diff --git a/server/admin-page.ts b/server/admin-page.ts
+index c57eea6..b258076 100644
+--- a/server/admin-page.ts
++++ b/server/admin-page.ts
+@@ -392,7 +392,7 @@ export const ADMIN_JS = String.raw`(function () {
+ 
+     var g = s.growth;
+     var tiles = clear($('tiles'));
+-    [['Accounts', g.accounts, ''], ['Characters', g.characters, ''], ['Played today', g.active.d1, 'key'], ['Played this week', g.active.d7, ''], ['Played this month', g.active.d30, '']].forEach(function (x) {
++    [['Accounts', g.accounts, ''], ['Guests now', g.guests, ''], ['Characters', g.characters, ''], ['Played today', g.active.d1, 'key'], ['Played this week', g.active.d7, ''], ['Played this month', g.active.d30, '']].forEach(function (x) {
+       var tile = h('div', 'tile' + (x[2] ? ' ' + x[2] : ''));
+       tile.appendChild(h('div', 'n', fmt(x[1]))); tile.appendChild(h('div', 'l', x[0]));
+       tiles.appendChild(tile);
+diff --git a/server/admin-rules.ts b/server/admin-rules.ts
+index c1eaa53..5b9f3ee 100644
+--- a/server/admin-rules.ts
++++ b/server/admin-rules.ts
+@@ -146,7 +146,8 @@ export interface AdminStats {
+   now: number;
+   online: OnlineNow;
+   site: SiteStatus;
+-  growth: { accounts: number; characters: number; trials: number; newAccounts: DayCount[]; newCharacters: DayCount[]; active: { d1: number; d7: number; d30: number } };
++  /** accounts: named accounts only; guests: Wake now guests not yet kept (shared/guest.ts), counted apart. */
++  growth: { accounts: number; guests: number; characters: number; trials: number; newAccounts: DayCount[]; newCharacters: DayCount[]; active: { d1: number; d7: number; d30: number } };
+   progress: { bands: { band: string; n: number }[]; atOrAbove25: number; races: { id: string; n: number }[]; classes: { id: string; n: number }[]; factions: { id: string; n: number }[] };
+   money: { active: number; comp: number; cancelling: number; lapsed: number };
+ }
+@@ -158,7 +159,7 @@ const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+ async function perDay(db: AdminSql, table: 'accounts' | 'characters', now: number, days: number): Promise<DayCount[]> {
+   const today = Math.floor(now / DAY_MS);
+   const from = (today - days + 1) * DAY_MS;
+-  const where = table === 'characters' ? 'created_at >= ? AND trial = 0' : 'created_at >= ?';
++  const where = table === 'characters' ? 'created_at >= ? AND trial = 0' : 'created_at >= ? AND guest = 0';
+   const rows = await db.all(`SELECT CAST(created_at / ${DAY_MS} AS INTEGER) AS d, COUNT(*) AS n FROM ${table} WHERE ${where} GROUP BY d`, from);
+   const by = new Map(rows.map((r) => [num(r.d), num(r.n)]));
+   return Array.from({ length: days }, (_, i) => { const d = today - days + 1 + i; return { day: dayKey(d * DAY_MS), n: by.get(d) ?? 0 }; });
+@@ -167,10 +168,10 @@ async function perDay(db: AdminSql, table: 'accounts' | 'characters', now: numbe
+ const grouped = async (db: AdminSql, col: 'race' | 'cls' | 'faction') =>
+   (await db.all(`SELECT ${col} AS id, COUNT(*) AS n FROM characters WHERE trial = 0 GROUP BY ${col} ORDER BY n DESC, id`)).map((r) => ({ id: String(r.id), n: num(r.n) }));
+ 
+-/** Everything the dashboard's overview shows. Proving Grounds trial characters are left out of every character count. */
++/** Everything the dashboard's overview shows. Proving Grounds trial characters are left out of every character count, and Wake now guests out of the account counts (they have their own). */
+ export async function adminStats(db: AdminSql, online: OnlineNow, now = Date.now()): Promise<AdminStats> {
+   const site = siteStatusFrom((await db.all('SELECT key, value FROM site_flags')).map((r) => ({ key: String(r.key), value: String(r.value) })));
+-  const totals = await db.first('SELECT (SELECT COUNT(*) FROM accounts) AS accounts, (SELECT COUNT(*) FROM characters WHERE trial = 0) AS characters, (SELECT COUNT(*) FROM characters WHERE trial = 1) AS trials');
++  const totals = await db.first('SELECT (SELECT COUNT(*) FROM accounts WHERE guest = 0) AS accounts, (SELECT COUNT(*) FROM accounts WHERE guest = 1) AS guests, (SELECT COUNT(*) FROM characters WHERE trial = 0) AS characters, (SELECT COUNT(*) FROM characters WHERE trial = 1) AS trials');
+   const active = await db.first(
+     'SELECT COALESCE(SUM(CASE WHEN last_played >= ? THEN 1 ELSE 0 END), 0) AS d1, COALESCE(SUM(CASE WHEN last_played >= ? THEN 1 ELSE 0 END), 0) AS d7, COALESCE(SUM(CASE WHEN last_played >= ? THEN 1 ELSE 0 END), 0) AS d30 FROM characters WHERE trial = 0',
+     now - DAY_MS, now - 7 * DAY_MS, now - 30 * DAY_MS,
+@@ -196,7 +197,7 @@ export async function adminStats(db: AdminSql, online: OnlineNow, now = Date.now
+     online,
+     site,
+     growth: {
+-      accounts: num(totals?.accounts), characters: num(totals?.characters), trials: num(totals?.trials),
++      accounts: num(totals?.accounts), guests: num(totals?.guests), characters: num(totals?.characters), trials: num(totals?.trials),
+       newAccounts: await perDay(db, 'accounts', now, 30), newCharacters: await perDay(db, 'characters', now, 30),
+       active: { d1: num(active?.d1), d7: num(active?.d7), d30: num(active?.d30) },
+     },
+diff --git a/server/api.ts b/server/api.ts
+index f85c835..b413d1a 100644
+--- a/server/api.ts
++++ b/server/api.ts
+@@ -5,7 +5,7 @@ import {
+   allowAdminAttempt, allowRedeemAttempt, makeRecoveryCode, recoveryState, register, resetPassword, sessionCookie, sessionToken,
+   allowGuestAttempt, createGuest, keepGuest,
+ } from './auth';
+-import { GUEST_LIMITED } from '../shared/guest';
++import { GUEST_LIMITED, GUEST_REFUSED } from '../shared/guest';
+ import { RESET_LIMITED } from './recovery-rules';
+ import { COMP_LIMITED, COMP_WRONG, compCodeMatches, compCodesFrom, compGrant } from './comp-rules';
+ import { accountData, adminSql, billing, characters, reports, site, type CharacterRecord } from './db';
+@@ -263,6 +263,7 @@ async function route(req: IncomingMessage, res: ServerResponse, world: World): P
+ 
+   if ((path === '/api/billing/checkout' || path === '/api/billing/portal') && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     if (!allowPerHour(billingHits, String(account.id), BILLING_PER_HOUR)) throw new HttpError(429, 'Too many requests. Try again in a little while.');
+   }
+   if (path === '/api/billing/checkout' && method === 'POST') {
+@@ -283,6 +284,7 @@ async function route(req: IncomingMessage, res: ServerResponse, world: World): P
+ 
+   if (path === '/api/characters' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     const b = await readJson(req);
+     const rec = createCharacter(account.id, b);
+     return sendJson(res, 201, { character: summary(rec) });
+@@ -290,6 +292,7 @@ async function route(req: IncomingMessage, res: ServerResponse, world: World): P
+ 
+   if (path === '/api/proving/characters' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     const refused = provingRefusal(provingOn(), enforcedNow(), billing.isMember(account.id), holdsPass(account.id));
+     if (refused) throw new HttpError(403, refused);
+     const b = await readJson(req);
+@@ -341,11 +344,13 @@ async function route(req: IncomingMessage, res: ServerResponse, world: World): P
+     const b = await readJson(req);
+     const r = await keepGuest(account.id, b.username, b.password);
+     if (!r.ok) throw new HttpError(r.status, r.error);
++    world.setGuest(account.id, false);
+     return sendJson(res, 200, { account: r.account, recoveryCode: r.recoveryCode });
+   }
+   // Complimentary access code (server/comp-rules.ts): COMP_CODES in the environment, read each time. Unset: every code is refused.
+   if (path === '/api/account/redeem' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     if (!allowRedeemAttempt(clientIp(req), account.id)) throw new HttpError(429, COMP_LIMITED);
+     const b = await readJson(req);
+     if (!compCodeMatches(b.code, compCodesFrom(process.env.COMP_CODES))) throw new HttpError(400, COMP_WRONG);
+diff --git a/server/app.ts b/server/app.ts
+index 25f08d4..bb15bc4 100644
+--- a/server/app.ts
++++ b/server/app.ts
+@@ -4,9 +4,10 @@ import { configureBilling, handleAdminRequest, handleApi, sendJson } from './api
+ import { isAdminPath } from './admin-route';
+ import type { BillingEnv } from './billing';
+ import { compEnd } from '../shared/membership';
+-import { billing, characters, closeDatabase, discovery, openDatabase, social } from './db';
++import { accounts, billing, characters, closeDatabase, discovery, openDatabase, social } from './db';
+ import { attachWebSocket } from './net';
+ import { serveStatic } from './static';
++import { guestsOnlineFrom } from './auth';
+ import { World, type CharacterStore } from './world/world';
+ 
+ /** The world's view of node:sqlite (synchronous, so World.join works without awaiting). */
+@@ -17,6 +18,7 @@ export const nodeCharacterStore: CharacterStore = {
+   findByName: (name) => characters.findByName(name),
+   membership: (accountId) => billing.isMember(accountId),
+   provingPass: (accountId) => compEnd(billing.get(accountId), Date.now()),
++  guest: (accountId) => accounts.byId(accountId)?.guest ?? false,
+   social,
+   discovery,
+ };
+@@ -42,6 +44,8 @@ export function startServer(opts: ServerOptions = {}): Promise<RunningServer> {
+   openDatabase(opts.dbFile);
+   configureBilling(opts.billing || opts.membershipEnforced !== undefined ? { env: opts.billing?.env ?? process.env, fetch: opts.billing?.fetch, enforced: opts.membershipEnforced } : null);
+   const world = new World(nodeCharacterStore, { membershipEnforced: opts.membershipEnforced });
++  // The hourly guest sweep (server/auth.ts) leaves alone any guest playing right now.
++  guestsOnlineFrom((accountId) => { for (const p of world.online.values()) if (p.accountId === accountId) return true; return false; });
+   world.start();
+ 
+   const server = createServer((req, res) => {
+diff --git a/server/auth.ts b/server/auth.ts
+index baccc8f..f8fcce2 100644
+--- a/server/auth.ts
++++ b/server/auth.ts
+@@ -14,7 +14,7 @@ import {
+ } from './recovery-rules';
+ import { ADMIN_RATE_DEFAULT } from './admin-rules';
+ import { allowPerHour } from './site-rules';
+-import { GUEST_FAILED, GUEST_PER_HOUR, guestSecret, guestUsername, NOT_A_GUEST } from '../shared/guest';
++import { GUEST_FAILED, GUEST_PER_HOUR, GUEST_STALE_MS, GUEST_SWEEP_EVERY_MS, guestSecret, guestUsername, NOT_A_GUEST } from '../shared/guest';
+ import { createGuestCharacter } from './characters';
+ 
+ export { COOKIE_NAME };
+@@ -105,11 +105,36 @@ export function allowGuestAttempt(ip: string): boolean {
+   return allowPerHour(guestByIp, ip, Number(process.env.GUEST_RATE_LIMIT ?? GUEST_PER_HOUR) || GUEST_PER_HOUR);
+ }
+ 
++// The hourly guest sweep (shared/guest.ts): guests never kept and not played for a day are deleted, with their heroes,
++// by the same statements as "Delete my account". Anyone online is skipped (app.ts tells this file who is).
++let lastGuestSweep = 0;
++let guestOnline: (accountId: number) => boolean = () => false;
++export function guestsOnlineFrom(fn: (accountId: number) => boolean): void { guestOnline = fn; }
++
++/** Deletes the guests stale at `now` that are not online; returns their account ids. */
++export function sweepGuests(now = Date.now()): number[] {
++  const gone: number[] = [];
++  for (const id of accounts.staleGuests(now - GUEST_STALE_MS)) {
++    if (guestOnline(id)) continue;
++    accountData.delete(id);
++    gone.push(id);
++  }
++  return gone;
++}
++
++/** The minute timer's call: sweeps at most once an hour. Null when it was not due. */
++export function maybeSweepGuests(now = Date.now()): number[] | null {
++  if (now - lastGuestSweep < GUEST_SWEEP_EVERY_MS) return null;
++  lastGuestSweep = now;
++  return sweepGuests(now);
++}
++
+ setInterval(() => {
+   const now = Date.now();
+   for (const m of [attempts, resetByIp, resetByName, redeemByIp, redeemByAccount, adminByIp]) for (const [k, list] of m) if (!list.some((t) => now - t < 5 * 60 * 1000)) m.delete(k);
+   try { sessions.purgeExpired(); } catch { /* the database was closed (a test or a shutdown) */ }
+   try { site.purgeOld(); } catch { /* the database was closed or never opened */ }
++  try { maybeSweepGuests(now); } catch { /* the database was closed or never opened */ }
+ }, 60_000).unref();
+ 
+ // ---------- Validation ----------
+diff --git a/server/db.ts b/server/db.ts
+index 47fe0af..a658019 100644
+--- a/server/db.ts
++++ b/server/db.ts
+@@ -15,7 +15,7 @@ import { exportRecovery, type ExportedRecovery } from './recovery-rules';
+ import { DAY_MS, decodePath, encodePath, type DiscoveryStore, type EchoRow, type MarkRow } from './discovery-store';
+ import { ECHO_LIFE_DAYS, MARK_FADE_SCORE, MARK_LIFE_DAYS } from '../shared/discovery-data';
+ import {
+-  accountDeleteStatements, characterDeleteStatements, CLIENT_ERROR_KEEP, CLIENT_ERROR_PER_HOUR, HOUR_MS, REPORT_KEEP_DAYS,
++  accountDeleteStatements, characterDeleteStatements, CLIENT_ERROR_KEEP, CLIENT_ERROR_PER_HOUR, GUEST_SWEEP_MAX, HOUR_MS, REPORT_KEEP_DAYS, STALE_GUESTS_SQL,
+   siteStatusFrom, type ClientErrorRow, type SiteStatus,
+ } from './site-rules';
+ import type { AdminSql } from './admin-rules';
+@@ -460,6 +460,10 @@ export const accounts = {
+       throw err;
+     }
+   },
++  /** Guests never kept and not played since `cutoff` (ms): the sweep's list (server/site-rules.ts STALE_GUESTS_SQL). */
++  staleGuests(cutoff: number, limit = GUEST_SWEEP_MAX): number[] {
++    return (db.prepare(STALE_GUESTS_SQL).all(cutoff, cutoff, limit) as Row[]).map((r) => Number(r.id));
++  },
+   /** Stores a new recovery code hash, replacing the old one (which stops working). */
+   setRecovery(id: number, hash: string, now = Date.now()): void {
+     db.prepare('UPDATE accounts SET recovery_hash = ?, recovery_at = ? WHERE id = ?').run(hash, now, id);
+diff --git a/server/site-rules.ts b/server/site-rules.ts
+index 5782911..7579885 100644
+--- a/server/site-rules.ts
++++ b/server/site-rules.ts
+@@ -97,6 +97,14 @@ export function accountDeleteStatements(accountId: number): Stmt[] {
+   ];
+ }
+ 
++/**
++ * Wake now guests (shared/guest.ts) never kept, made before `cutoff` (ms), with no character played since then: the
++ * hourly sweep deletes each with accountDeleteStatements. Params: cutoff, cutoff, limit.
++ */
++export const STALE_GUESTS_SQL = 'SELECT a.id FROM accounts a WHERE a.guest = 1 AND a.created_at < ? AND NOT EXISTS (SELECT 1 FROM characters c WHERE c.account_id = a.id AND c.last_played >= ?) ORDER BY a.id LIMIT ?';
++/** Guests one sweep deletes at most (the next hour takes the rest). */
++export const GUEST_SWEEP_MAX = 200;
++
+ /** Sliding one-hour counter per key (in memory). Records the hit and returns false when over `max`. */
+ export function allowPerHour(hits: Map<string, number[]>, key: string, max: number, now = Date.now()): boolean {
+   const list = (hits.get(key) ?? []).filter((t) => now - t < HOUR_MS);
+diff --git a/server/world/entities.ts b/server/world/entities.ts
+index 463fd6c..2254b6a 100644
+--- a/server/world/entities.ts
++++ b/server/world/entities.ts
+@@ -361,6 +361,8 @@ export class Player extends Entity {
+   resource = 0; maxResource = 100;
+   /** Wakeborn Membership (shared/membership.ts): a paying member, the highest level whose experience this character earns, and whether it was told it has stopped earning. Set when it joins and when billing changes (World.applyMembership). */
+   member = false; /** End (ms) of a live complimentary access, 0 for none. */ passEnd = 0; xpCap = 60; capNoted = false;
++  /** A Wake now guest not yet kept (shared/guest.ts): dungeons, the raid, the Group Finder and the Proving Grounds wait until the hero is kept. Set at join and when the account is kept (World.setGuest). */
++  guest = false;
+   /** Shadowblade combo points (0..MAX_COMBO), and when one was last gained (they fade out of combat). */
+   combo = 0; comboAt = 0;
+   /** Pyreborn Heat (the resource): the gauge may overheat again (it fell below the re-arm line), until when Overheat lasts, whether it still burns, and when the next burn tick falls. */
+diff --git a/server/world/world.ts b/server/world/world.ts
+index 30366d3..7623e42 100644
+--- a/server/world/world.ts
++++ b/server/world/world.ts
+@@ -39,6 +39,7 @@ import { handleRecollect, rebuild as rebuildRecollections, sanitizePicks } from
+ import { sanitizeEchoes } from './waking';
+ import { Social, type SocialRelay, type SocialRow, type SocialStore } from './social';
+ import { PROVING_APART, PROVING_KEEPS, PROVING_ZONE, fillWaitSeconds, partyRefusal, provingRefusal, queueRoleOfGear, runLevel } from '../../shared/proving';
++import { guestRefusal } from '../../shared/guest';
+ import { provingOn } from '../proving-flag';
+ import { hallInstance } from '../characters';
+ import { leaveHall, provingObserver, skipTutorial, startTutorial, wearSet, wornRole } from './proving';
+@@ -63,6 +64,8 @@ export interface CharacterStore {
+   membership?(accountId: number): boolean | Promise<boolean>;
+   /** Optional: the end (ms) of the account's live complimentary access (an access code), or 0 for none. A holder may use the Proving Grounds even while the flag is off. Without it nobody holds a pass. */
+   provingPass?(accountId: number): number | Promise<number>;
++  /** Optional: whether the account is a Wake now guest not yet kept (shared/guest.ts). Without it nobody is a guest. */
++  guest?(accountId: number): boolean | Promise<boolean>;
+   /** Optional: friends and ignore lists (Q6). Without it the social commands answer that friends are not available. */
+   social?: SocialStore;
+   /**
+@@ -201,6 +204,11 @@ export class World {
+     for (const p of this.online.values()) if (p.accountId === accountId && !p.removed) { p.passEnd = passEnd; this.applyMembership(p, member); }
+   }
+ 
++  /** A guest kept the hero (shared/guest.ts): every character of the account online here may now go everywhere. */
++  setGuest(accountId: number, guest: boolean): void {
++    for (const p of this.online.values()) if (p.accountId === accountId && !p.removed) p.guest = guest;
++  }
++
+   /** Does this player hold a complimentary access that has not ended? Read at the moment of each trial action, so an expiry takes effect on the next one. */
+   private holdsPass(p: Player): boolean { return p.passEnd > Date.now(); }
+ 
+@@ -208,6 +216,8 @@ export class World {
+   membershipRefusal(p: Player, zoneId: string): string | null {
+     const def = ZONES[zoneId];
+     if (!def) return null;
++    // A guest (shared/guest.ts) plays the open world; dungeons and the raid wait until the hero is kept.
++    if (p.guest && def.dungeon) return guestRefusal(true);
+     return contentRefusal(def.levels, !!def.dungeon, p.level, this.enforced, p.member, p.trial);
+   }
+ 
+@@ -329,18 +339,18 @@ export class World {
+     let rows: SocialRow[] = [];
+     try { const r = this.store.social?.list(characterId); if (Array.isArray(r)) rows = r; } catch (err) { console.error('[social] list failed:', err); }
+     const pass = this.store.provingPass?.(accountId);
+-    return this.joinRecord(conn, accountId, rec, rows, !!this.store.membership?.(accountId), typeof pass === 'number' ? pass : 0);
++    return this.joinRecord(conn, accountId, rec, rows, !!this.store.membership?.(accountId), typeof pass === 'number' ? pass : 0, this.store.guest?.(accountId) === true);
+   }
+ 
+   /** join for asynchronous stores: waits for any save of this character still in flight, then loads it. */
+   async joinAsync(conn: Connection, accountId: number, characterId: number): Promise<Player | string> {
+     await this.pending.get(characterId);
+-    const [rec, rows, member, pass] = await Promise.all([this.store.load(characterId), this.social.rowsFor(characterId), this.store.membership?.(accountId) ?? false, this.store.provingPass?.(accountId) ?? 0]);
+-    return this.joinRecord(conn, accountId, rec, rows, !!member, pass);
++    const [rec, rows, member, pass, guest] = await Promise.all([this.store.load(characterId), this.social.rowsFor(characterId), this.store.membership?.(accountId) ?? false, this.store.provingPass?.(accountId) ?? 0, this.store.guest?.(accountId) ?? false]);
++    return this.joinRecord(conn, accountId, rec, rows, !!member, pass, guest === true);
+   }
+ 
+   /** Puts a loaded character into the world. */
+-  joinRecord(conn: Connection, accountId: number, loaded: CharacterRecord | null, socialRows: SocialRow[] = [], member = false, passEnd = 0): Player | string {
++  joinRecord(conn: Connection, accountId: number, loaded: CharacterRecord | null, socialRows: SocialRow[] = [], member = false, passEnd = 0, guest = false): Player | string {
+     let rec = loaded;
+     if (!rec || rec.accountId !== accountId) return 'That character does not exist.';
+     const characterId = rec.id;
+@@ -361,6 +371,8 @@ export class World {
+     // (Cloudflare: a reconnect that raced its own hand-off save). Refuse, and the client retries.
+     // A Proving Grounds character (beta test mode) stays in its hall or in a run: never in the open world, whatever its row says.
+     if (rec.trial) {
++      // A guest never has a Proving Grounds character; refused all the same should one turn up.
++      if (guest) return guestRefusal(true)!;
+       // Closed when the flag is off, and members only once membership is enforced (shared/proving.ts provingRefusal).
+       const refused = provingRefusal(this.proving, this.enforced, member, passEnd > Date.now());
+       if (refused) return refused;
+@@ -384,6 +396,7 @@ export class World {
+     const player = this.playerFromRecord(rec);
+     if (sent) player.saveDirty = true;
+     player.passEnd = passEnd;
++    player.guest = guest;
+     this.applyMembership(player, member, false);
+     player.instance = place.instance;
+     if (rec.trial) player.saveDirty = true;
+@@ -923,6 +936,7 @@ export class World {
+ 
+   /** The common refusals of every trial action: the flag, membership once enforced, and being a trial character at all. True when it may go on. */
+   private provingGate(p: Player): boolean {
++    if (p.guest) { p.error(guestRefusal(true)!); return false; }
+     const refused = provingRefusal(this.proving, this.enforced, p.member, this.holdsPass(p));
+     if (refused) { p.error(refused); return false; }
+     if (!p.trial) { p.error('Only a Proving Grounds character can do that.'); return false; }
+@@ -1066,6 +1080,7 @@ export class World {
+ 
+   /** Queue alone or, as the party leader, with the party. Everything is checked here; the matchmaker re-checks the levels. */
+   private queueJoin(p: Player, wanted: string[], roles: QueueRole[]): void {
++    if (p.guest) return p.error(guestRefusal(true)!);
+     if (p.dead) return p.error('You are dead.');
+     if (p.zone.instance) return p.error('Leave the dungeon before you queue for another.');
+     const party = p.party;
+@@ -1078,6 +1093,7 @@ export class World {
+         if (!m.player || m.player.removed || !this.online.has(m.cid)) return p.error(`${m.name} is not here. Everyone in the party must be online and in this region to queue.`);
+         if (m.player.zone.instance) return p.error(`${m.name} is inside a dungeon.`);
+         if (m.player.dead) return p.error(`${m.name} is dead.`);
++        if (m.player.guest) return p.error(`${m.name} is playing as a guest and cannot queue until they keep their hero.`);
+         people.push(m.player);
+       }
+       // The leader first.
+diff --git a/tests/cf-check.ts b/tests/cf-check.ts
+index 3c4041f..995b671 100644
+--- a/tests/cf-check.ts
++++ b/tests/cf-check.ts
+@@ -108,7 +108,7 @@ async function recoverySequence(a: AccountsLike, s: SessionsLike, username: stri
+ 
+ // Wake now guests (shared/guest.ts; server/auth.ts and worker/auth.ts go through these): marked at creation, the mark on the
+ // session, and Keep this hero refusing a taken name, then naming the account once.
+-type GuestAccountsLike = { create(u: string, p: string, t?: string, r?: string, g?: boolean): any; byId(id: number): any; keep(id: number, u: string, p: string, r: string, now?: number): any };
++type GuestAccountsLike = { create(u: string, p: string, t?: string, r?: string, g?: boolean): any; byId(id: number): any; keep(id: number, u: string, p: string, r: string, now?: number): any; staleGuests(cutoff: number, limit?: number): any };
+ async function guestSequence(a: GuestAccountsLike, s: SessionsLike): Promise<string> {
+   const out: unknown[] = [];
+   const view = (r: any) => r && { username: r.username, guest: r.guest, passHash: r.passHash, recoveryHash: r.recoveryHash, recoveryAt: r.recoveryAt };
+@@ -119,6 +119,10 @@ async function guestSequence(a: GuestAccountsLike, s: SessionsLike): Promise<str
+   out.push(await a.keep(g.id, 'taken_one', 'pw2', 'rc2', 9000), view(await a.byId(g.id)));
+   out.push(await a.keep(g.id, 'Kept_One', 'pw3', 'rc3', 9000), view(await a.byId(g.id)), await s.get('gs1'));
+   out.push(await a.keep(g.id, 'Kept_Two', 'pw4', 'rc4', 9100), view(await a.byId(g.id)));
++  // The sweep's list: an unkept guest with no character played is stale once the cutoff passes its creation; a kept one never.
++  const g2 = await a.create('guest_seqtest002', 'secret', '', '', true);
++  const soon = await a.staleGuests(Date.now() + 60_000), before = await a.staleGuests(Date.now() - 60_000);
++  out.push(soon.includes(g2.id), soon.includes(g.id), before.includes(g2.id), (await a.staleGuests(Date.now() + 60_000, 0)).length);
+   return JSON.stringify(out);
+ }
+ 
+@@ -266,8 +270,8 @@ if ((await d1.sessions.get('h1'))?.username !== 'Parity_User') fail('D1 session
+ if (await d1.sessions.get('h2')) fail('D1 returned an expired session');
+ const d1Guest = await guestSequence(d1.accounts, d1.sessions);
+ if (d1Guest !== nodeGuest) fail(`guests differ:\n  node ${nodeGuest}\n  d1   ${d1Guest}`);
+-else if (!/^\[\{"username":"guest_seqtest001","guest":true.*,true,"taken",.*"ok",\{"username":"Kept_One","guest":false,"passHash":"pw3","recoveryHash":"rc3","recoveryAt":9000\},.*"gone"/.test(d1Guest)) fail(`unexpected guest answers: ${d1Guest}`);
+-else log('guests and Keep this hero: the same answers from node:sqlite and D1 (marked, marked on the session, a taken name refused, kept once with the name, password and code, then refused)');
++else if (!/^\[\{"username":"guest_seqtest001","guest":true.*,true,"taken",.*"ok",\{"username":"Kept_One","guest":false,"passHash":"pw3","recoveryHash":"rc3","recoveryAt":9000\},.*"gone",.*,true,false,false,0\]$/.test(d1Guest)) fail(`unexpected guest answers: ${d1Guest}`);
++else log('guests and Keep this hero: the same answers from node:sqlite and D1 (marked, marked on the session, a taken name refused, kept once with the name, password and code, then refused; the list the sweep deletes)');
+ // Wake now (shared/guest.ts): the guest mark is stored, read back on the account and on its session; a normal account has none.
+ {
+   const g = (await d1.accounts.create('guest_paritycheck', 'x', '2026-10-01', '', true))!;
+diff --git a/tests/cf-local.ts b/tests/cf-local.ts
+index 8493efc..2444b0e 100644
+--- a/tests/cf-local.ts
++++ b/tests/cf-local.ts
+@@ -224,6 +224,64 @@ try {
+     log('recovery: code shown once, password change ends other sessions, reset spends the code, one generic answer, new code replaces old, export has no hash, reset limit (Worker, D1)');
+   }
+ 
++  // Wake now on the Worker (shared/guest.ts; AuthDO, D1, the cron sweep): refused while closed and without the 16+ box, a
++  // guest with its hero in Lanternfield, its doors, Keep this hero with a recovery code, 3 guests per address per hour (the
++  // Worker sees every call here as one address), and the scheduled sweep deleting a stale guest with its hero.
++  {
++    const j = async (path: string, init: RequestInit = {}) => {
++      const r = await call(path, init);
++      return { status: r.status, json: (await r.json().catch(() => null)) as any, cookie: (r.headers.get('set-cookie') ?? '').split(';')[0] };
++    };
++    const post = (path: string, body: unknown, cookie = '') => j(path, { method: 'POST', body: JSON.stringify(body), headers: cookie ? { Cookie: cookie } : {} });
++    const d1 = (sql: string) => spawnSync(sh(['npx', 'wrangler', 'd1', 'execute', 'orvandel', '--local', '-c', CONFIG, '--persist-to', `${STATE}/state`, '--command', `"${sql}"`]), { stdio: 'ignore', shell: true }).status;
++    const REFUSED = 'Keep your hero first: name an account to go here.';
++    d1("INSERT INTO site_flags (key, value) VALUES ('closed', '1')");
++    const closed = await post('/api/guest', { acceptTerms: true });
++    d1('DELETE FROM site_flags');
++    if (closed.status !== 503) fail(`Wake now while closed -> ${closed.status}`);
++    const unticked = await post('/api/guest', { acceptTerms: false });
++    if (unticked.status !== 400 || unticked.cookie) fail(`Wake now without the box -> ${unticked.status}`);
++    // Guest 1 of 3 on this address.
++    const g = await post('/api/guest', { acceptTerms: true });
++    const hero = g.json?.character;
++    if (g.status !== 201 || g.json?.account?.guest !== true || !/^guest_[a-z2-7]{10}$/.test(g.json?.account?.username ?? '') || !g.cookie) fail(`Wake now -> ${g.status} ${JSON.stringify(g.json)}`);
++    if (hero?.race !== 'human' || hero?.cls !== 'vanguard' || hero?.level !== 1 || hero?.zone !== 'lanternfield' || JSON.stringify(g.json).includes('pbkdf2') || 'recoveryCode' in (g.json ?? {})) fail(`the guest's hero: ${JSON.stringify(g.json)}`);
++    const ses = await j('/api/session', { headers: { Cookie: g.cookie } });
++    const list = await j('/api/characters', { headers: { Cookie: g.cookie } });
++    if (ses.json?.account?.guest !== true || list.json?.characters?.[0]?.id !== hero?.id) fail(`the guest after a reload: ${JSON.stringify(ses.json)} ${JSON.stringify(list.json)?.slice(0, 200)}`);
++    const doors = [
++      await post('/api/characters', { name: 'Secondguest', faction: 'concord', race: 'human', cls: 'vanguard' }, g.cookie),
++      await post('/api/proving/characters', { name: 'Proveguest', faction: 'concord', race: 'human', cls: 'vanguard' }, g.cookie),
++      await post('/api/account/redeem', { code: 'ANY-CODE' }, g.cookie),
++      await post('/api/billing/checkout', {}, g.cookie),
++    ];
++    if (doors.some((r) => r.status !== 403 || r.json?.error !== REFUSED)) fail(`a guest's doors: ${doors.map((r) => `${r.status} ${r.json?.error}`).join(' | ')}`);
++    // Keep this hero.
++    const name = `wakekeeper${process.pid}`.slice(0, 20);
++    if ((await post('/api/account/keep', { username: name, password: 'short' }, g.cookie)).status !== 400) fail('keep took a weak password');
++    const kept = await post('/api/account/keep', { username: name, password: 'a kept password' }, g.cookie);
++    const keptSes = await j('/api/session', { headers: { Cookie: g.cookie } });
++    if (kept.status !== 200 || !/^[0-9A-Z]{5}(-[0-9A-Z]{5}){3}$/.test(kept.json?.recoveryCode ?? '') || keptSes.json?.account?.username !== name || 'guest' in (keptSes.json?.account ?? {})) fail(`keep -> ${kept.status} ${JSON.stringify(kept.json)}; session ${JSON.stringify(keptSes.json)}`);
++    if ((await post('/api/login', { username: name, password: 'a kept password' })).status !== 200) fail('the kept account does not log in');
++    if ((await post('/api/account/keep', { username: `${name}x`.slice(0, 20), password: 'a kept password' }, g.cookie)).status !== 409) fail('a kept account kept again');
++    // Guests 2 and 3, then the limit.
++    const g2 = await post('/api/guest', { acceptTerms: true });
++    const g3 = await post('/api/guest', { acceptTerms: true });
++    const g4 = await post('/api/guest', { acceptTerms: true });
++    if (g2.status !== 201 || g3.status !== 201 || g4.status !== 429) fail(`3 guests an hour per address: ${g2.status}, ${g3.status}, ${g4.status}`);
++    // The sweep the cron runs (through the test hook, which calls the same function as scheduled()): g2 left alone for a day goes,
++    // with its hero; g3 played recently stays.
++    d1(`UPDATE accounts SET created_at = 1 WHERE id IN (${g2.json?.account?.id}, ${g3.json?.account?.id})`);
++    d1(`UPDATE characters SET last_played = 1 WHERE account_id = ${g2.json?.account?.id}`);
++    const sweep = await post('/api/test/sweep', {});
++    let swept = false;
++    for (let i = 0; i < 20 && !swept; i++) { swept = (await j('/api/session', { headers: { Cookie: g2.cookie } })).json?.account === null; if (!swept) await sleep(250); }
++    const stays = await j('/api/session', { headers: { Cookie: g3.cookie } });
++    if (sweep.status !== 200 || sweep.json?.swept !== 1 || !swept || stays.json?.account?.guest !== true) fail(`the sweep: ${sweep.status} ${JSON.stringify(sweep.json)}, stale guest gone ${swept}, recent guest ${JSON.stringify(stays.json)}`);
++    if ((await j('/api/session', { headers: { Cookie: g.cookie } })).json?.account?.username !== name) fail('the sweep touched a kept account');
++    log('Wake now: closed and unticked refused, a guest with its hero, its doors shut with one line, Keep this hero, 3 an hour per address, the cron sweep (Worker, D1)');
++  }
++
+   // Complimentary access codes on the Worker (COMP_CODES, passed with --var): one generic refusal, a right code granting
+   // 90 days as a 'comp' row, the account state and the export showing it, and a signed Stripe cancel leaving it alone.
+   {
+diff --git a/tests/verify-guest.ts b/tests/verify-guest.ts
+index e2758ba..6bdf2a7 100644
+--- a/tests/verify-guest.ts
++++ b/tests/verify-guest.ts
+@@ -2,22 +2,30 @@
+ // Covers: a guest made with one click (the 16+ box required), its hero (a level 1 Human Vanguard in Lanternfield with a
+ // valid, unique name and a random body type), the session it gets and keeps across a reload, the secret password never
+ // returned and no recovery code, the per-address limit of 3 an hour (and the hour ending), refusal while the realm is
+-// closed, the CSRF check, and the reserved guest_ prefix for sign-up.
++// closed, the CSRF check, and the reserved guest_ prefix for sign-up. Keep this hero (sign-up's rules and messages, the
++// same session and hero after). The guest's doors (more characters, the Proving Grounds, access codes, payments, dungeon
++// doors, the Group Finder) and their opening live once kept; the hourly sweep (only stale, unkept, offline guests, at most
++// once an hour); and the admin dashboard counting guests apart.
+ // Run: npx tsx tests/verify-guest.ts
+ import { endProcess } from './exit';
+ import { rmSync } from 'node:fs';
+ import { resolve } from 'node:path';
+-import { advance, installVirtualClock } from './vclock';
++import { installVirtualClock } from './vclock';
++import { allowPerHour } from '../server/site-rules';
+ import { GUEST_LIMITED, GUEST_PER_HOUR, GUEST_REFUSED, guestNameCandidates, guestUsername, isGuestName } from '../shared/guest';
+ import { validateName } from '../shared/appearance';
+-import { ZONES } from '../shared/zones';
++import { ZONES, doorsInto } from '../shared/zones';
+ import { USERNAME_RE } from '../server/auth-rules';
++import type { ServerMsg } from '../shared/protocol';
++import type { Connection } from '../server/world/entities';
+ 
+ installVirtualClock(4242);
+ // The test names the client address itself, so every phase has its own IP and its own limits.
+ process.env.TRUST_PROXY = '1';
+ const { startServer } = await import('../server/app');
+-const { accounts, characters, site } = await import('../server/db');
++const { accounts, adminSql, characters, site } = await import('../server/db');
++const { maybeSweepGuests, sweepGuests } = await import('../server/auth');
++const { adminStats } = await import('../server/admin-rules');
+ 
+ const DB = resolve(`tmp/guest-${process.pid}.db`);
+ let failures = 0;
+@@ -129,10 +137,101 @@ check(byIp.slice(0, 3).every((s) => s === 201) && byIp[3] === 429 && byIp[4] ===
+ check((await wake(ipL)).json?.error === GUEST_LIMITED, 'with one plain line');
+ check((await call('POST', '/api/register', { username: 'stilltheycan', password: 'a long password', acceptTerms: true }, from(ipL))).status === 201, 'the limited address can still make a named account');
+ check((await wake(freshIp())).status === 201, 'another address is not limited');
+-await advance(10 * 60_000);
+-check((await wake(ipL)).status === 429, 'ten minutes later it is still limited (the window is an hour, not the five minutes of sign-up)');
+-await advance(3600_000);
+-check((await wake(ipL)).status === 201, 'after the hour it can wake again');
++// The window itself, on the counter both backends use (server/site-rules.ts allowPerHour), at explicit times: advancing the
++// virtual clock by an hour would run the whole world for an hour.
++const hits = new Map<string, number[]>();
++const t0 = 1_900_000_000_000;
++const tries = [0, 1, 2, 3].map((i) => allowPerHour(hits, 'ip', GUEST_PER_HOUR, t0 + i * 1000));
++check(tries.join() === 'true,true,true,false', `the counter allows 3 then refuses (${tries.join()})`);
++check(!allowPerHour(hits, 'ip', GUEST_PER_HOUR, t0 + 10 * 60_000), 'ten minutes later it is still limited (the window is an hour, not the five minutes of sign-up)');
++check(allowPerHour(hits, 'ip', GUEST_PER_HOUR, t0 + 3600_000 + 1000), 'after the hour it can wake again');
++
++// ---------- The guest's doors: one calm line at each, open once the hero is kept ----------
++const ipD = freshIp();
++const d = await wake(ipD);
++const dc = d.cookie;
++const asGuest = (method: string, path: string, body?: unknown) => call(method, path, body, from(ipD, dc));
++const refusedLine = (r: { status: number; json: any }) => r.status === 403 && r.json?.error === GUEST_REFUSED;
++check(refusedLine(await asGuest('POST', '/api/characters', { name: 'Secondwake', faction: 'concord', race: 'human', cls: 'vanguard' })), 'a guest cannot make a second character');
++check(refusedLine(await asGuest('POST', '/api/proving/characters', { name: 'Provewake', faction: 'concord', race: 'human', cls: 'vanguard' })), 'nor a Proving Grounds character');
++check(refusedLine(await asGuest('POST', '/api/account/redeem', { code: 'ANY-CODE' })), 'nor redeem an access code');
++check(refusedLine(await asGuest('POST', '/api/billing/checkout', {})) && refusedLine(await asGuest('POST', '/api/billing/portal', {})), 'nor start a payment or open the billing portal');
++check((await call('POST', '/api/characters', { name: 'Namedwake', faction: 'concord', race: 'human', cls: 'vanguard' }, from(freshIp(), named.cookie))).status === 201, 'a named account still makes characters as before');
++
++class Ear implements Connection {
++  got: ServerMsg[] = []; closed = '';
++  send(m: ServerMsg) { this.got.push(m); }
++  close(r?: string) { this.closed = r ?? 'closed'; }
++}
++const world = srv.world;
++const errorsOf = (ear: Ear) => ear.got.filter((m) => m.t === 'error').map((m) => (m as { text: string }).text);
++const dEar = new Ear();
++const dp = world.join(dEar, d.json.account.id, d.json.character.id);
++if (typeof dp === 'string') throw new Error(dp);
++check(dp.guest === true && dp.zone.id === 'lanternfield', 'the guest\'s hero joins the world carrying the guest mark');
++const door = doorsInto('unrung-chapel')[0];
++const atDoor = () => {
++  if (dp.zone.id !== door.zone.id) world.transfer(dp, door.zone.id, { x: door.door.x, z: door.door.z, ry: 0 });
++  dp.x = door.door.x; dp.z = door.door.z; dp.y = dp.zone.groundY(dp.x, dp.z); dp.arrivedAt = 0; dp.atDoor = null;
++};
++atDoor();
++dEar.got.length = 0;
++world.handle(dp, { t: 'dungeon', op: 'enter', story: true });
++check(!dp.zone.instance && errorsOf(dEar).includes(GUEST_REFUSED), `a dungeon door gives the guest the one line (${errorsOf(dEar).join('|')})`);
++dEar.got.length = 0;
++world.handle(dp, { t: 'queue', op: 'join', dungeons: ['unrung-chapel'], roles: ['damage'] });
++check(errorsOf(dEar).includes(GUEST_REFUSED) && !dEar.got.some((m) => m.t === 'queueState' && (m as { state?: string }).state === 'queued'), 'so does the Group Finder');
++dEar.got.length = 0;
++world.handle(dp, { t: 'proving', op: 'tutorial', action: 'start' });
++check(errorsOf(dEar).includes(GUEST_REFUSED), 'and the Proving Grounds');
++const raid = doorsInto('heart-of-vael')[0];
++check(!!raid && world.membershipRefusal(dp, raid.door.dungeon) === GUEST_REFUSED && world.membershipRefusal(dp, 'lanternfield') === null, 'the raid is a dungeon like the rest; the open lands stay open');
++// Kept while playing: the doors open at once.
++const keptLive = await call('POST', '/api/account/keep', { username: 'Doorkeeper', password: 'a door password' }, from(ipD, dc));
++check(keptLive.status === 200 && dp.guest === false, 'keeping the hero while it plays lifts the mark at once');
++atDoor();
++dEar.got.length = 0;
++world.handle(dp, { t: 'dungeon', op: 'enter', story: true });
++check(!errorsOf(dEar).includes(GUEST_REFUSED), `and the door no longer gives the guest line (${dp.zone.instance ? 'went in' : errorsOf(dEar).join('|') || 'no error'})`);
++check((await call('POST', '/api/characters', { name: 'Keptsecond', faction: 'concord', race: 'human', cls: 'vanguard' }, from(ipD, dc))).status === 201, 'and a second character can be made');
++world.leave(dp);
++
++// ---------- The hourly sweep: stale, unkept, offline guests only ----------
++const s1 = await wake(freshIp()); // left alone for a day: swept
++const s2 = await wake(freshIp()); // played recently: stays
++const s3 = await wake(freshIp()); // kept: stays
++const s4 = await wake(freshIp()); // online right now: stays
++await call('POST', '/api/account/keep', { username: 'Sweptnot', password: 'a long password' }, from(freshIp(), s3.cookie));
++const sEar = new Ear();
++const sp = world.join(sEar, s4.json.account.id, s4.json.character.id);
++if (typeof sp === 'string') throw new Error(sp);
++const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
++const peek = new DatabaseSync(DB);
++const later = Date.now() + 25 * 3600_000;
++peek.prepare('UPDATE characters SET last_played = ? WHERE id = ?').run(later - 2 * 3600_000, s2.json.character.id);
++const exists = (id: number) => !!accounts.byId(id);
++const s1Hero = s1.json.character.id;
++const gone = sweepGuests(later);
++check(gone.includes(s1.json.account.id) && !exists(s1.json.account.id) && !characters.get(s1Hero), 'a guest nobody played for a day is deleted, with its hero');
++check(Number((peek.prepare('SELECT COUNT(*) AS n FROM sessions WHERE account_id = ?').get(s1.json.account.id) as { n: number }).n) === 0, 'and its session');
++check((await call('GET', '/api/session', undefined, from(freshIp(), s1.cookie))).json?.account === null, 'its old cookie signs in nobody');
++check(exists(s2.json.account.id) && !gone.includes(s2.json.account.id), 'a guest played within the day stays');
++check(exists(s3.json.account.id) && accounts.byId(s3.json.account.id)?.guest === false, 'a kept hero stays');
++check(exists(s4.json.account.id) && !gone.includes(s4.json.account.id), 'a guest playing right now is skipped');
++check(exists(named.json.account.id), 'named accounts are never touched');
++world.leave(sp);
++const first = maybeSweepGuests(later);
++const tooSoon = maybeSweepGuests(later + 10 * 60_000);
++const hourOn = maybeSweepGuests(later + 61 * 60_000);
++check(Array.isArray(first) && tooSoon === null && Array.isArray(hourOn), 'the minute timer sweeps at most once an hour');
++check(!!first?.includes(s4.json.account.id) && !exists(s4.json.account.id), 'once offline and still stale, the skipped guest goes on the next sweep');
++
++// ---------- The admin dashboard counts guests apart ----------
++const counts = peek.prepare('SELECT SUM(guest = 1) AS g, SUM(guest = 0) AS a FROM accounts').get() as { g: number; a: number };
++const stats = await adminStats(adminSql, { total: 0, zones: [] });
++check(stats.growth.guests === Number(counts.g) && stats.growth.accounts === Number(counts.a) && Number(counts.g) > 0, `accounts (${stats.growth.accounts}) and guests now (${stats.growth.guests}) are counted apart`);
++check(stats.growth.newAccounts.reduce((s, x) => s + x.n, 0) === Number(counts.a), 'and new guests do not count as new accounts');
++peek.close();
+ 
+ // ---------- Closed for maintenance, and the CSRF check ----------
+ site.setFlag('closed', '1');
+diff --git a/worker/d1.ts b/worker/d1.ts
+index 3524423..2c20414 100644
+--- a/worker/d1.ts
++++ b/worker/d1.ts
+@@ -4,7 +4,7 @@
+ // migrations/ (tests/cf-check.ts fails until the two schemas agree).
+ import type { AccountExport, AccountRecord, CharacterRecord, CharacterSave, InstanceSave, NewCharacter, SocialRow } from '../server/db';
+ import {
+-  accountDeleteStatements, characterDeleteStatements, CLIENT_ERROR_KEEP, CLIENT_ERROR_PER_HOUR, HOUR_MS, REPORT_KEEP_DAYS,
++  accountDeleteStatements, characterDeleteStatements, CLIENT_ERROR_KEEP, CLIENT_ERROR_PER_HOUR, GUEST_SWEEP_MAX, HOUR_MS, REPORT_KEEP_DAYS, STALE_GUESTS_SQL,
+   siteStatusFrom, type ClientErrorRow, type SiteStatus,
+ } from '../server/site-rules';
+ import { NAME_KEY_SQL } from '../shared/social';
+@@ -115,6 +115,10 @@ export function repos(db: D1Like) {
+         throw err;
+       }
+     },
++    /** Guests never kept and not played since `cutoff` (ms): the sweep's list (server/site-rules.ts STALE_GUESTS_SQL). */
++    async staleGuests(cutoff: number, limit = GUEST_SWEEP_MAX): Promise<number[]> {
++      return (await db.prepare(STALE_GUESTS_SQL).bind(cutoff, cutoff, limit).all<Row>()).results.map((r) => Number(r.id));
++    },
+     /** Stores a new recovery code hash, replacing the old one (which stops working). */
+     async setRecovery(id: number, hash: string, now = Date.now()): Promise<void> {
+       await db.prepare('UPDATE accounts SET recovery_hash = ?, recovery_at = ? WHERE id = ?').bind(hash, now, id).run();
+@@ -262,6 +266,7 @@ export function repos(db: D1Like) {
+     social,
+     membership: (accountId) => billing.isMember(accountId),
+     provingPass: async (accountId) => compEnd(await billing.get(accountId), Date.now()),
++    guest: async (accountId) => (await accounts.byId(accountId))?.guest ?? false,
+   };
+ 
+   // Chalk marks and echoes (server/discovery-store.ts): a zone object reads its list once when it first needs it and
+diff --git a/worker/index.ts b/worker/index.ts
+index 6578794..75b2f7a 100644
+--- a/worker/index.ts
++++ b/worker/index.ts
+@@ -10,6 +10,7 @@ import { nameKey } from '../shared/social';
+ import '../server/content'; // registers the server-only zones so the Worker can route to them
+ import type { AccountInfo } from '../shared/protocol';
+ import { cleanReport, REPORT_MAX_BODY, REPORT_MAX_PER_HOUR, REPORT_WINDOW_MS } from '../server/report-rules';
++import { GUEST_REFUSED, GUEST_STALE_MS } from '../shared/guest';
+ import { allowPerHour, cleanClientError, CLIENT_ERROR_MAX_BODY, CLIENT_ERROR_PER_IP, CLOSED_TEXT, TERMS_REQUIRED, termsAccepted, writeAllowed } from '../server/site-rules';
+ import { BILLING_PER_HOUR, billingConfigFrom, cancelForDeletion, handleWebhook, openPortal, startCheckout, type BillingRow, type BillingStore } from '../server/billing';
+ import { characterSlots, compEnd, isMember, MEMBERSHIP_ENFORCED, membershipInfo } from '../shared/membership';
+@@ -160,6 +161,7 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+ 
+   if ((path === '/api/billing/checkout' || path === '/api/billing/portal') && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     if (!allowPerHour(billingHits, String(account.id), BILLING_PER_HOUR)) throw new HttpError(429, 'Too many requests. Try again in a little while.');
+   }
+   if (path === '/api/billing/checkout' && method === 'POST') {
+@@ -183,6 +185,7 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+ 
+   if (path === '/api/characters' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     const b = await readJson(req);
+     // Name uniqueness is left to the UNIQUE constraint (one round trip fewer).
+     // The name's look-alike key is looked up first (same rule as Node); an exact duplicate is still left to the constraint.
+@@ -197,6 +200,7 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+ 
+   if (path === '/api/proving/characters' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     const flag = provingFlag(env.PROVING_GROUNDS);
+     const row = await db.billing.get(account.id);
+     const refused = provingRefusal(flag, MEMBERSHIP_ENFORCED, flag && MEMBERSHIP_ENFORCED && isMember(row?.status ?? '', row?.end ?? 0, Date.now()), compEnd(row, Date.now()) > 0);
+@@ -246,11 +250,16 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+     const b = await readJson(req);
+     const r = await env.AUTH.get(env.AUTH.idFromName(req.headers.get('CF-Connecting-IP') ?? 'local')).keepGuest(account.id, b.username, b.password);
+     if (!r.ok) throw new HttpError(r.status, r.error);
++    // Its hero, if it is playing right now, may go everywhere at once (best effort: the next join reads it from D1 anyway).
++    for (const c of await db.characters.listByAccount(account.id)) {
++      try { await env.ZONE.get(env.ZONE.idFromName(routeOf(c).object)).guestKept(account.id); } catch (err) { console.error('[guest] zone not told', c.id, err); }
++    }
+     return json(200, { account: r.account, recoveryCode: r.recoveryCode });
+   }
+   // Complimentary access code (server/comp-rules.ts): the COMP_CODES secret. Limited per IP and per account (AuthDO slots).
+   if (path === '/api/account/redeem' && method === 'POST') {
+     if (!account) throw new HttpError(401, 'Not logged in.');
++    if (account.guest) throw new HttpError(403, GUEST_REFUSED);
+     const ip = req.headers.get('CF-Connecting-IP') ?? 'local';
+     if (!(await env.AUTH.get(env.AUTH.idFromName(ip)).takeRedeemSlot())) throw new HttpError(429, COMP_LIMITED);
+     if (!(await env.AUTH.get(env.AUTH.idFromName(`account:${account.id}`)).takeRedeemSlot())) throw new HttpError(429, COMP_LIMITED);
+@@ -304,6 +313,8 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
+   if (env.TEST_HOOKS === '1' && path === '/api/test/match' && method === 'GET') {
+     return json(200, await env.MATCH.get(env.MATCH.idFromName('match')).debug());
+   }
++  // tests/cf-local.ts runs the hourly guest sweep (the same function scheduled() runs) at a moment it chooses.
++  if (env.TEST_HOOKS === '1' && path === '/api/test/sweep' && method === 'POST') return json(200, { swept: (await sweepGuests(env)).length });
+   // The load test (tests/load-swarm.ts) reads a zone object's player count and message counters.
+   if (env.TEST_HOOKS === '1' && path === '/api/test/stats' && method === 'GET') {
+     return json(200, await env.ZONE.get(env.ZONE.idFromName(url.searchParams.get('zone') ?? '')).stats());
+@@ -398,7 +409,25 @@ async function websocket(req: Request, env: Env, url: URL): Promise<Response> {
+   return env.ZONE.get(env.ZONE.idFromName(route.object)).fetch(new Request(req.url, { headers }));
+ }
+ 
++/**
++ * The hourly guest sweep (wrangler.toml [triggers] crons; shared/guest.ts): guests never kept and not played for a day are
++ * deleted, with their heroes, by the same batch as "Delete my account". Anyone that stale is offline: a zone saves a
++ * playing character's last_played as it goes, and the idle logout ends a forgotten session long before a day.
++ */
++async function sweepGuests(env: Env, now = Date.now()): Promise<number[]> {
++  const db = repos(env.DB);
++  const gone: number[] = [];
++  for (const id of await db.accounts.staleGuests(now - GUEST_STALE_MS)) {
++    try { await db.accountData.delete(id); gone.push(id); } catch (err) { console.error('[guest] sweep failed', id, err); }
++  }
++  if (gone.length) console.log(`[guest] swept ${gone.length} stale guest${gone.length === 1 ? '' : 's'}`);
++  return gone;
++}
++
+ export default {
++  async scheduled(_event, env, ctx): Promise<void> {
++    ctx.waitUntil(sweepGuests(env));
++  },
+   async fetch(req, env): Promise<Response> {
+     const url = new URL(req.url);
+     try {
+diff --git a/worker/zone.ts b/worker/zone.ts
+index 475ab0c..e6c1b3c 100644
+--- a/worker/zone.ts
++++ b/worker/zone.ts
+@@ -177,6 +177,11 @@ export class ZoneDO extends DurableObject<Env> {
+     this.world?.setMember(accountId, member, passEnd);
+   }
+ 
++  /** A guest kept the hero (shared/guest.ts): its characters online here may now go everywhere. */
++  async guestKept(accountId: number): Promise<void> {
++    this.world?.setGuest(accountId, false);
++  }
++
+   /** Disconnects a character (before the Worker deletes it). Waits for its save. */
+   async kick(characterId: number, reason: string): Promise<void> {
+     if (!this.world) return;
+diff --git a/wrangler.toml b/wrangler.toml
+index e432f3e..699dbd8 100644
+--- a/wrangler.toml
++++ b/wrangler.toml
+@@ -62,3 +62,8 @@ PROVING_GROUNDS = "0"
+ # Wakeborn Membership (docs/LAUNCH.md section 7). Secrets, set with `npx wrangler secret put`, never here: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET.
+ # Optional plain variables: PUBLIC_URL (Checkout return address) and STRIPE_TAX = "1" (only once Stripe Tax is set up).
+ # The switch for the XP cap and the gated lands is MEMBERSHIP_ENFORCED in shared/membership.ts (off by default).
++
++# The hourly guest sweep (worker/index.ts scheduled, shared/guest.ts): Wake now guests never kept and not played for a
++# day are deleted. Cron triggers are part of the Workers plan already in use.
++[triggers]
++crons = ["17 * * * *"]
+-- 
+2.53.0.windows.2
+
